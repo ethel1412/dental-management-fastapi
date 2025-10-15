@@ -68,3 +68,27 @@ class Lab(Base):
     # Relationships
     user = relationship("User", backref="lab_profile")
     lab_orders = relationship("LabOrder", back_populates="lab")
+
+    def to_dict(self):
+        """Convert lab object to dictionary"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "lab_id": self.lab_id,
+            "lab_name": self.lab_name,
+            "lab_type": self.lab_type.value if self.lab_type else None,
+            "owner_name": self.owner_name,
+            "lab_address": self.lab_address,
+            "city": self.city,
+            "state": self.state,
+            "pincode": self.pincode,
+            "license_number": self.license_number,
+            "pickup_available": self.pickup_available,
+            "delivery_available": self.delivery_available,
+            "free_delivery": self.free_delivery,
+            "registration_certificate_path": self.registration_certificate_path,
+            "lab_image_path": self.lab_image_path,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
