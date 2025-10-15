@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas.user import UserCreate, UserLogin, UserResponse, OTPResponse, TokenResponse
 from app.services.auth_service import AuthService
 
+
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
 
 @router.post("/register", response_model=OTPResponse)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -23,6 +25,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
         mobile_number=new_user.mobile_number
     )
 
+
 @router.post("/login", response_model=OTPResponse)
 def login(credentials: UserLogin, db: Session = Depends(get_db)):
     """Login user - returns OTP on screen"""
@@ -38,9 +41,19 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
         mobile_number=user.mobile_number
     )
 
+
 @router.post("/verify-otp", response_model=TokenResponse)
-def verify_otp(mobile_number: str, otp: str, db: Session = Depends(get_db)):
-    """Verify OTP and get access token"""
+def verify_otp(otp_data: dict = Body(...), db: Session = Depends(get_db)):
+    """Verify OTP and get access token - accepts JSON body"""
+    mobile_number = otp_data.get("mobile_number")
+    otp = otp_data.get("otp")
+    
+    if not mobile_number or not otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mobile_number and otp are required"
+        )
+    
     access_token, user = AuthService.verify_otp_and_generate_token(
         db=db,
         mobile_number=mobile_number,
@@ -54,9 +67,18 @@ def verify_otp(mobile_number: str, otp: str, db: Session = Depends(get_db)):
         user=user_response
     )
 
+
 @router.post("/resend-otp", response_model=OTPResponse)
-def resend_otp(mobile_number: str, db: Session = Depends(get_db)):
-    """Resend OTP"""
+def resend_otp(resend_data: dict = Body(...), db: Session = Depends(get_db)):
+    """Resend OTP - accepts JSON body"""
+    mobile_number = resend_data.get("mobile_number")
+    
+    if not mobile_number:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mobile_number is required"
+        )
+    
     from app.models.user import User
     from app.utils.security import generate_otp
     from datetime import datetime, timedelta
