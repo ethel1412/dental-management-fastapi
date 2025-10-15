@@ -1,0 +1,81 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from app.database import get_db
+from app.schemas.user import UserCreate, UserLogin, UserResponse, OTPResponse, TokenResponse
+from app.services.auth_service import AuthService
+
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+
+@router.post("/register", response_model=OTPResponse)
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user - returns OTP on screen"""
+    new_user = AuthService.register_user(
+        db=db,
+        mobile_number=user.mobile_number,
+        email=user.email,
+        password=user.password,
+        role=user.role
+    )
+    
+    return OTPResponse(
+        message="Registration successful. Please verify OTP",
+        otp=new_user.otp,
+        mobile_number=new_user.mobile_number
+    )
+
+@router.post("/login", response_model=OTPResponse)
+def login(credentials: UserLogin, db: Session = Depends(get_db)):
+    """Login user - returns OTP on screen"""
+    user, otp = AuthService.login_user(
+        db=db,
+        mobile_number=credentials.mobile_number,
+        password=credentials.password
+    )
+    
+    return OTPResponse(
+        message="Login successful. Please verify OTP",
+        otp=otp,
+        mobile_number=user.mobile_number
+    )
+
+@router.post("/verify-otp", response_model=TokenResponse)
+def verify_otp(mobile_number: str, otp: str, db: Session = Depends(get_db)):
+    """Verify OTP and get access token"""
+    access_token, user = AuthService.verify_otp_and_generate_token(
+        db=db,
+        mobile_number=mobile_number,
+        otp=otp
+    )
+    
+    user_response = UserResponse.from_orm(user)
+    
+    return TokenResponse(
+        access_token=access_token,
+        user=user_response
+    )
+
+@router.post("/resend-otp", response_model=OTPResponse)
+def resend_otp(mobile_number: str, db: Session = Depends(get_db)):
+    """Resend OTP"""
+    from app.models.user import User
+    from app.utils.security import generate_otp
+    from datetime import datetime, timedelta
+    
+    user = db.query(User).filter(User.mobile_number == mobile_number).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Generate new OTP
+    new_otp = generate_otp()
+    user.otp = new_otp
+    user.otp_expiry = datetime.utcnow() + timedelta(minutes=10)
+    db.commit()
+    
+    return OTPResponse(
+        message="OTP resent successfully",
+        otp=new_otp,
+        mobile_number=user.mobile_number
+    )

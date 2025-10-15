@@ -1,0 +1,10 @@
+from app.routes.auth import router as auth_router
+from app.routes.doctor import router as doctor_router
+from app.routes.clinic import router as clinic_router
+from app.routes.lab import router as lab_router
+from app.routes.patient import router as patient_router
+from app.routes.appointment import router as appointment_router
+from app.routes.clinical_profile import router as clinical_profile_router
+from app.routes.lab_order import router as lab_order_router
+from app.routes.payment import router as payment_router
+from app.routes.ml_analysis import router as ml_analysis_router
