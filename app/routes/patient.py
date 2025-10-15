@@ -1,55 +1,98 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
 from sqlalchemy.orm import Session
+import os
+import time
 from app.database import get_db
 from app.models.user import User, UserRole
 from app.models.patient import Patient
-from app.schemas.patient import PatientCreate, PatientUpdate, PatientResponse
+from app.schemas.patient import PatientUpdate, PatientResponse
 from app.services.auth_service import AuthService
 from app.services.file_service import FileService
 from app.utils.dependencies import require_role
 from app.utils.security import generate_unique_id
 
+
 router = APIRouter(prefix="/api/patients", tags=["Patients"])
 
+
 @router.post("/register", response_model=dict)
-def register_patient(patient_data: PatientCreate, db: Session = Depends(get_db)):
-    """Register a new patient"""
-    # Register user first
-    user = AuthService.register_user(
-        db=db,
-        mobile_number=patient_data.mobile_number,
-        email=patient_data.email,
-        password=patient_data.password,
-        role=UserRole.PATIENT
-    )
-    
-    # Generate patient ID
-    last_patient = db.query(Patient).order_by(Patient.id.desc()).first()
-    patient_id = generate_unique_id("PAT", last_patient.id if last_patient else None)
-    
-    # Create patient profile
-    new_patient = Patient(
-        user_id=user.id,
-        patient_id=patient_id,
-        full_name=patient_data.full_name,
-        age=patient_data.age,
-        date_of_birth=patient_data.date_of_birth,
-        gender=patient_data.gender,
-        address=patient_data.address,
-        pincode=patient_data.pincode,
-        consent_given=patient_data.consent_given
-    )
-    
-    db.add(new_patient)
-    db.commit()
-    db.refresh(new_patient)
-    
-    return {
-        "message": "Patient registered successfully. Please verify OTP",
-        "otp": user.otp,
-        "patient_id": new_patient.patient_id,
-        "user_id": user.id
-    }
+async def register_patient(
+    mobile_number: str = Form(...),
+    full_name: str = Form(...),
+    age: int = Form(...),
+    gender: str = Form(...),
+    email: str = Form(None),
+    address: str = Form(None),
+    consent_given: bool = Form(True),
+    profile_image: UploadFile = File(None),
+    db: Session = Depends(get_db)
+):
+    """Register a new patient with form data"""
+    try:
+        print("=== Patient Registration Started ===")
+        print(f"Mobile: {mobile_number}")
+        print(f"Name: {full_name}")
+        
+        # Check if user exists with this mobile number
+        user = db.query(User).filter(User.mobile_number == mobile_number).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found. Please register first.")
+        
+        if user.role != "patient":
+            raise HTTPException(status_code=400, detail="User is not registered as a patient")
+        
+        # Check if patient profile already exists
+        existing_patient = db.query(Patient).filter(Patient.user_id == user.id).first()
+        if existing_patient:
+            raise HTTPException(status_code=400, detail="Patient profile already exists")
+        
+        # Handle profile image upload
+        profile_image_path = None
+        if profile_image and profile_image.filename:
+            file_extension = profile_image.filename.split('.')[-1]
+            filename = f"patient_{mobile_number}_{int(time.time())}.{file_extension}"
+            file_path = os.path.join("uploads", "profiles", filename)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            with open(file_path, "wb") as buffer:
+                content = await profile_image.read()
+                buffer.write(content)
+            
+            profile_image_path = f"/profiles/{filename}"
+        
+        # Generate patient ID
+        patient_id = generate_unique_id(prefix="PAT", length=8)
+        
+        # Create patient profile
+        new_patient = Patient(
+            user_id=user.id,
+            patient_id=patient_id,
+            full_name=full_name,
+            age=age,
+            gender=gender,
+            address=address,
+            consent_given=consent_given,
+            profile_image_path=profile_image_path,
+            is_active=True
+        )
+        
+        db.add(new_patient)
+        db.commit()
+        db.refresh(new_patient)
+        
+        print("Patient created successfully!")
+        
+        return {
+            "message": "Patient registered successfully",
+            "patient": new_patient.to_dict()
+        }
+        
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.get("/profile", response_model=PatientResponse)
 def get_patient_profile(current_user: User = Depends(require_role([UserRole.PATIENT]))):
@@ -61,6 +104,7 @@ def get_patient_profile(current_user: User = Depends(require_role([UserRole.PATI
             detail="Patient profile not found"
         )
     return patient
+
 
 @router.put("/profile", response_model=PatientResponse)
 def update_patient_profile(
@@ -84,6 +128,7 @@ def update_patient_profile(
     db.refresh(patient)
     return patient
 
+
 @router.post("/upload-profile-image")
 async def upload_profile_image(
     file: UploadFile = File(...),
@@ -106,6 +151,7 @@ async def upload_profile_image(
         "message": "Profile image uploaded successfully",
         "file_path": FileService.get_file_url(file_path)
     }
+
 
 @router.get("/{patient_id}", response_model=PatientResponse)
 def get_patient_by_id(

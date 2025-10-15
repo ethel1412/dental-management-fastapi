@@ -32,3 +32,22 @@ class Patient(Base):
     user = relationship("User", backref="patient_profile")
     appointments = relationship("Appointment", back_populates="patient")
     clinical_profiles = relationship("ClinicalProfile", back_populates="patient")
+
+    def to_dict(self):
+        """Convert patient object to dictionary"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "patient_id": self.patient_id,
+            "full_name": self.full_name,
+            "date_of_birth": self.date_of_birth.isoformat() if self.date_of_birth else None,
+            "age": self.age,
+            "gender": self.gender.value if self.gender else None,
+            "address": self.address,
+            "pincode": self.pincode,
+            "profile_image_path": self.profile_image_path,
+            "consent_given": self.consent_given,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
