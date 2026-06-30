@@ -1,106 +1,341 @@
 import torch
+import torch.nn as nn
 import torchvision
+import torchvision.transforms.functional as TF
 from torchvision import transforms
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.ops import nms
 from PIL import Image
 import numpy as np
-import json
-from typing import Dict, List
+import cv2
+import io
+import base64
+from typing import Dict, List, Optional
 from app.config import settings
 
+# ── Disease class map (matches Stage 2 v7 training) ──────────────────────────
+DISEASE_CLASSES = {
+    0: "Healthy",
+    1: "Impacted",
+    2: "Caries",
+    3: "Periapical Lesion",
+    4: "Deep Caries",
+}
+
+DISEASE_COLORS_BGR = {
+    "Healthy":           (100, 220,   0),
+    "Impacted":          (  0, 100, 255),
+    "Caries":            ( 50,  50, 255),
+    "Deep Caries":       (200,   0, 200),
+    "Periapical Lesion": (  0, 200, 255),
+}
+
+DISEASE_SEVERITY = {
+    "Healthy":           "none",
+    "Impacted":          "moderate",
+    "Caries":            "mild",
+    "Deep Caries":       "severe",
+    "Periapical Lesion": "severe",
+}
+
+DISEASE_ADVICE = {
+    "Healthy":           "This tooth appears healthy. Maintain regular brushing and flossing.",
+    "Impacted":          "An impacted tooth may require orthodontic or surgical evaluation. Consult your dentist.",
+    "Caries":            "Early-stage cavity detected. A dental filling is usually sufficient at this stage.",
+    "Deep Caries":       "Advanced decay detected. Root canal treatment or crown may be needed. See a dentist soon.",
+    "Periapical Lesion": "Infection at the tooth root detected. Prompt dental treatment is strongly advised.",
+}
+
+# ── Quadrant colours for segmentation overlay ────────────────────────────────
+QUADRANT_COLORS = [
+    (255, 100,  60),   # Q1 – upper right (orange-red)
+    ( 60, 180, 255),   # Q2 – upper left  (sky blue)
+    ( 60, 220,  80),   # Q3 – lower left  (green)
+    (220, 100, 255),   # Q4 – lower right (violet)
+]
+
+
 class MLService:
-    
+
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = None
-        self.load_model()
-    
-    def load_model(self):
-        """Load the Mask R-CNN model"""
+        self.stage1_model: Optional[torch.nn.Module] = None
+        self.stage2_model: Optional[torch.nn.Module] = None
+        self._load_models()
+
+    # ── Model loaders ──────────────────────────────────────────────────────
+
+    def _build_stage1(self, num_classes: int = 33) -> torch.nn.Module:
+        model = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=None)
+        in_feat = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_feat, num_classes)
+        in_feat_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+        model.roi_heads.mask_predictor = MaskRCNNPredictor(in_feat_mask, 256, num_classes)
+        return model
+
+    def _build_stage2(self, num_classes: int = 5) -> torch.nn.Module:
+        model = torchvision.models.resnet34(weights=None)
+        model.fc = nn.Sequential(
+            nn.Dropout(p=0.5),
+            nn.Linear(model.fc.in_features, num_classes),
+        )
+        return model
+
+    def _load_models(self):
+        # Stage 1
         try:
-            self.model = torch.load(settings.ML_MODEL_PATH, map_location=self.device)
-            self.model.eval()
-            print("ML Model loaded successfully")
+            ckpt = torch.load(settings.ML_MODEL_PATH, map_location=self.device, weights_only=False)
+            self.stage1_model = self._build_stage1(num_classes=33)
+            state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
+            self.stage1_model.load_state_dict(state, strict=False)
+            self.stage1_model.to(self.device).eval()
+            print(f"[ML] Stage 1 (Mask R-CNN) loaded on {self.device}")
         except Exception as e:
-            print(f"Error loading ML model: {str(e)}")
-            self.model = None
-    
-    def preprocess_image(self, image_path: str):
-        """Preprocess image for model input"""
-        image = Image.open(image_path).convert("RGB")
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-        return transform(image).unsqueeze(0).to(self.device)
-    
-    def analyze_xray(self, image_path: str) -> Dict:
-        """Analyze dental X-ray image"""
-        if self.model is None:
-            return {
-                "status": "error",
-                "message": "ML model not loaded"
-            }
-        
+            print(f"[ML] Stage 1 load error: {e}")
+            self.stage1_model = None
+
+        # Stage 2
         try:
-            # Preprocess image
-            image_tensor = self.preprocess_image(image_path)
-            
-            # Run inference
-            with torch.no_grad():
-                predictions = self.model(image_tensor)
-            
-            # Process results
-            result = self.process_predictions(predictions[0])
-            
+            ckpt2 = torch.load(settings.ML_STAGE2_MODEL_PATH, map_location=self.device, weights_only=False)
+            self.stage2_model = self._build_stage2(num_classes=5)
+            state2 = ckpt2['model_state_dict'] if isinstance(ckpt2, dict) and 'model_state_dict' in ckpt2 else ckpt2
+            self.stage2_model.load_state_dict(state2, strict=False)
+            self.stage2_model.to(self.device).eval()
+            print(f"[ML] Stage 2 (ResNet-34 classifier) loaded on {self.device}")
+        except Exception as e:
+            print(f"[ML] Stage 2 load error: {e}")
+            self.stage2_model = None
+
+    # ── Stage 1 inference ─────────────────────────────────────────────────
+
+    def _stage1_infer(self, img_tensor: torch.Tensor, conf: float = 0.5, iou_thr: float = 0.3):
+        with torch.no_grad():
+            raw = self.stage1_model([img_tensor.to(self.device)])[0]
+        keep = raw['scores'] >= conf
+        filt = {k: v[keep] for k, v in raw.items()}
+        if len(filt['boxes']) > 0:
+            idx = nms(filt['boxes'], filt['scores'], iou_thr)
+            filt = {k: v[idx] for k, v in filt.items()}
+        return filt
+
+    # ── Stage 2 inference on a single crop ────────────────────────────────
+
+    _stage2_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    def _classify_crop(self, pil_img: Image.Image) -> Dict:
+        tensor = self._stage2_transform(pil_img).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.stage2_model(tensor)
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+        label = int(probs.argmax())
+        return {
+            "disease": DISEASE_CLASSES[label],
+            "confidence": round(float(probs[label]), 4),
+            "probabilities": {
+                DISEASE_CLASSES[i]: round(float(p), 4)
+                for i, p in enumerate(probs)
+            },
+        }
+
+    # ── FDI tooth numbering ────────────────────────────────────────────────
+    # Stage 1 labels 1..32 (background = 0) mapped to FDI notation.
+    # We use image-midpoint quadrant split to assign Q1-Q4 and then
+    # number each tooth within its quadrant by x-position.
+
+    @staticmethod
+    def _assign_fdi(boxes_xyxy: np.ndarray, img_w: int, img_h: int) -> List[int]:
+        """Return FDI tooth number for each box."""
+        mid_x, mid_y = img_w / 2, img_h / 2
+        fdi_numbers = []
+        # Group boxes per quadrant first so we can rank by position
+        quadrant_boxes: Dict[int, List] = {1: [], 2: [], 3: [], 4: []}
+        for i, box in enumerate(boxes_xyxy):
+            cx = (box[0] + box[2]) / 2
+            cy = (box[1] + box[3]) / 2
+            # Patient's right = image left (cx < mid_x)
+            if cy <= mid_y and cx > mid_x:
+                q = 1   # upper right
+            elif cy <= mid_y and cx <= mid_x:
+                q = 2   # upper left
+            elif cy > mid_y and cx <= mid_x:
+                q = 3   # lower left
+            else:
+                q = 4   # lower right
+            quadrant_boxes[q].append((cx, i))
+
+        # FDI: Q1 = 11-18, Q2 = 21-28, Q3 = 31-38, Q4 = 41-48
+        fdi_start = {1: 11, 2: 21, 3: 31, 4: 41}
+        index_result = [0] * len(boxes_xyxy)
+        for q, items in quadrant_boxes.items():
+            # Within Q1/Q4 sort ascending cx (incisor→molar away from midline)
+            # Within Q2/Q3 sort descending cx
+            reverse = q in (2, 3)
+            items_sorted = sorted(items, key=lambda t: t[0], reverse=reverse)
+            for rank, (_, orig_idx) in enumerate(items_sorted):
+                fdi = fdi_start[q] + rank
+                index_result[orig_idx] = min(fdi, fdi_start[q] + 7)  # cap at 8 teeth/quadrant
+        return index_result
+
+    # ── Annotated image builder ────────────────────────────────────────────
+
+    @staticmethod
+    def _image_to_b64(pil_img: Image.Image) -> str:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=88)
+        return base64.b64encode(buf.getvalue()).decode()
+
+    # ── Main pipeline ─────────────────────────────────────────────────────
+
+    def analyze_xray(self, image_path: str) -> Dict:
+        """Full Stage 1 + Stage 2 pipeline. Returns structured result + annotated image."""
+        if self.stage1_model is None:
+            return {"status": "error", "message": "Stage 1 model not loaded"}
+
+        try:
+            pil_img = Image.open(image_path).convert("RGB")
+            img_w, img_h = pil_img.size
+            img_tensor = TF.to_tensor(pil_img)
+
+            # ── Stage 1: detect all teeth ─────────────────────────────────
+            s1 = self._stage1_infer(img_tensor)
+            boxes_np = s1['boxes'].cpu().numpy()      # (N, 4) xyxy
+            masks_np = s1['masks'].cpu().numpy()      # (N, 1, H, W)
+            scores_np = s1['scores'].cpu().numpy()
+
+            fdi_list = self._assign_fdi(boxes_np, img_w, img_h)
+
+            # Build annotated image (numpy BGR)
+            annotated = np.array(pil_img)[..., ::-1].copy()  # RGB → BGR
+            mid_x, mid_y = img_w // 2, img_h // 2
+
+            # Draw quadrant dividers
+            cv2.line(annotated, (mid_x, 0), (mid_x, img_h), (255, 255, 255), 2)
+            cv2.line(annotated, (0, mid_y), (img_w, mid_y), (255, 255, 255), 2)
+            for i, label in enumerate([("Q1", mid_x + 10, 20), ("Q2", 10, 20),
+                                        ("Q3", 10, mid_y + 20), ("Q4", mid_x + 10, mid_y + 20)]):
+                cv2.putText(annotated, label[0], (label[1], label[2]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            # ── Stage 2: classify each tooth crop ─────────────────────────
+            teeth_results = []
+            summary_disease_counts: Dict[str, int] = {}
+
+            for i, (box, mask, score, fdi) in enumerate(zip(boxes_np, masks_np, scores_np, fdi_list)):
+                x1, y1, x2, y2 = (
+                    max(0, int(box[0]) - 10),
+                    max(0, int(box[1]) - 10),
+                    min(img_w, int(box[2]) + 10),
+                    min(img_h, int(box[3]) + 10),
+                )
+                crop = pil_img.crop((x1, y1, x2, y2))
+
+                if self.stage2_model is not None and crop.width > 4 and crop.height > 4:
+                    cls_result = self._classify_crop(crop)
+                else:
+                    cls_result = {"disease": "Unknown", "confidence": 0.0, "probabilities": {}}
+
+                disease = cls_result["disease"]
+                color_bgr = DISEASE_COLORS_BGR.get(disease, (128, 128, 128))
+
+                # Draw segmentation mask overlay
+                mask_bin = (mask[0] > 0.5).astype(np.uint8)
+                color_layer = np.zeros_like(annotated)
+                color_layer[mask_bin == 1] = color_bgr
+                annotated = cv2.addWeighted(annotated, 1.0, color_layer, 0.45, 0)
+
+                # Draw bounding box
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color_bgr, 2)
+
+                # Draw FDI label
+                label_txt = f"{fdi}" if fdi else "?"
+                cv2.putText(annotated, label_txt, (x1 + 2, y1 + 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bgr, 2)
+
+                # Disease indicator dot (top-right of box)
+                if disease != "Healthy":
+                    cv2.circle(annotated, (x2 - 6, y1 + 6), 6, (0, 0, 255), -1)
+
+                summary_disease_counts[disease] = summary_disease_counts.get(disease, 0) + 1
+
+                teeth_results.append({
+                    "fdi_number": fdi,
+                    "detection_confidence": round(float(score), 4),
+                    "bounding_box": {"x1": int(box[0]), "y1": int(box[1]),
+                                     "x2": int(box[2]), "y2": int(box[3])},
+                    "disease": disease,
+                    "disease_confidence": cls_result["confidence"],
+                    "disease_probabilities": cls_result["probabilities"],
+                    "severity": DISEASE_SEVERITY.get(disease, "unknown"),
+                    "advice": DISEASE_ADVICE.get(disease, ""),
+                })
+
+            # Overall health summary
+            total = len(teeth_results)
+            diseased = sum(1 for t in teeth_results if t["disease"] != "Healthy")
+            healthy = total - diseased
+
+            if total == 0:
+                overall_status = "no_teeth_detected"
+            elif diseased == 0:
+                overall_status = "all_healthy"
+            elif diseased <= total * 0.25:
+                overall_status = "mostly_healthy"
+            elif diseased <= total * 0.5:
+                overall_status = "moderate_issues"
+            else:
+                overall_status = "significant_issues"
+
+            # Convert annotated image to base64
+            annotated_pil = Image.fromarray(annotated[..., ::-1])  # BGR → RGB
+            annotated_b64 = self._image_to_b64(annotated_pil)
+
             return {
                 "status": "success",
-                "analysis": result
+                "summary": {
+                    "total_teeth_detected": total,
+                    "healthy_teeth": healthy,
+                    "diseased_teeth": diseased,
+                    "overall_status": overall_status,
+                    "disease_breakdown": summary_disease_counts,
+                },
+                "teeth": teeth_results,
+                "annotated_image_base64": annotated_b64,
+                "model_info": {
+                    "stage1": "Mask R-CNN (ResNet-50 FPN, 33 classes)",
+                    "stage2": "ResNet-34 (5-class: Healthy/Impacted/Caries/Periapical/DeepCaries)",
+                    "device": str(self.device),
+                },
             }
-        
+
         except Exception as e:
-            return {
-                "status": "error",
-                "message": str(e)
-            }
-    
+            import traceback
+            return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
+
     def process_predictions(self, prediction: Dict) -> Dict:
-        """Process model predictions into readable format"""
+        """Legacy helper kept for backward compat."""
         boxes = prediction['boxes'].cpu().numpy()
         labels = prediction['labels'].cpu().numpy()
         scores = prediction['scores'].cpu().numpy()
         masks = prediction['masks'].cpu().numpy()
-        
-        # Filter by confidence threshold
         threshold = 0.5
-        valid_indices = scores >= threshold
-        
-        detected_teeth = []
-        for i, (box, label, score, mask) in enumerate(zip(
-            boxes[valid_indices],
-            labels[valid_indices],
-            scores[valid_indices],
-            masks[valid_indices]
-        )):
-            tooth_data = {
+        valid = scores >= threshold
+        teeth = []
+        for box, label, score, mask in zip(boxes[valid], labels[valid], scores[valid], masks[valid]):
+            teeth.append({
                 "tooth_id": int(label),
                 "confidence": float(score),
-                "bounding_box": {
-                    "x1": float(box[0]),
-                    "y1": float(box[1]),
-                    "x2": float(box[2]),
-                    "y2": float(box[3])
-                },
-                "mask_area": float(mask.sum())
-            }
-            detected_teeth.append(tooth_data)
-        
-        return {
-            "total_teeth_detected": len(detected_teeth),
-            "teeth": detected_teeth,
-            "model_info": {
-                "model_type": "Mask R-CNN",
-                "device": str(self.device)
-            }
-        }
+                "bounding_box": {"x1": float(box[0]), "y1": float(box[1]),
+                                  "x2": float(box[2]), "y2": float(box[3])},
+                "mask_area": float(mask.sum()),
+            })
+        return {"total_teeth_detected": len(teeth), "teeth": teeth,
+                "model_info": {"model_type": "Mask R-CNN", "device": str(self.device)}}
 
-# Global instance
+
+# Global singleton
 ml_service = MLService()
