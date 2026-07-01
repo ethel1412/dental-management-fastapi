@@ -100,7 +100,12 @@ class AuthService:
         user.otp_expiry = None
         db.commit()
         
-        # Generate token
-        access_token = create_access_token(data={"sub": user.id, "role": user.role})
+        # Generate token — sub MUST be a string per JWT spec (RFC 7519 §4.1.2).
+        # python-jose 3.3.0 raises JWTClaimsError on decode if sub is an integer,
+        # which causes every authenticated request to return 401.
+        access_token = create_access_token(data={
+            "sub": str(user.id),
+            "role": user.role.value,  # serialize enum to plain string
+        })
         
         return access_token, user

@@ -34,12 +34,16 @@ app = FastAPI(
 )
 
 # CORS middleware
+# SECURITY NOTE: allow_origins=["*"] with allow_credentials=True is invalid per
+# the CORS spec — browsers reject it — and is flagged in security audits.
+# We use explicit origins from .env (ALLOWED_ORIGINS) with credentials enabled.
+# For local development set: ALLOWED_ORIGINS=http://localhost:3000,http://10.0.2.2:8000
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your Flutter app's domain
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Mount static files (uploads)
