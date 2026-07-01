@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/ml-analysis", tags=["ML Analysis"])
 @router.post("/analyze-xray")
 async def analyze_xray(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),   # both doctor & patient
+    current_user: User = Depends(get_current_user),
 ):
     """
     Upload a panoramic dental X-ray and get instant AI analysis.
@@ -38,11 +38,18 @@ async def analyze_xray(
 @router.post("/analyze-xray-direct")
 async def analyze_xray_direct(
     file: UploadFile = File(...),
-    current_user: User = Depends(require_role([UserRole.DOCTOR])),
+    current_user: User = Depends(get_current_user),  # any authenticated user
 ):
-    """Doctor-only: analyze without attaching to a clinical profile."""
+    """Analyze X-ray without attaching to a clinical profile. Available to all authenticated users."""
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image (JPEG/PNG).")
+
     file_path = await FileService.save_file(file, "xrays", "temp")
     result = ml_service.analyze_xray(file_path)
+
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("message", "Analysis failed"))
+
     return {
         "message": "X-ray analysis completed",
         "result": result,
