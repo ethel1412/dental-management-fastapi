@@ -85,7 +85,7 @@ class MLService:
     def _load_models(self):
         # Stage 1
         try:
-            ckpt = torch.load(settings.ML_MODEL_PATH, map_location=self.device, weights_only=False)
+            ckpt = torch.load(settings.STAGE1_MODEL_PATH, map_location=self.device, weights_only=False)
             self.stage1_model = self._build_stage1(num_classes=33)
             state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
             self.stage1_model.load_state_dict(state, strict=False)
@@ -97,7 +97,7 @@ class MLService:
 
         # Stage 2
         try:
-            ckpt2 = torch.load(settings.ML_STAGE2_MODEL_PATH, map_location=self.device, weights_only=False)
+            ckpt2 = torch.load(settings.STAGE2_MODEL_PATH, map_location=self.device, weights_only=False)
             self.stage2_model = self._build_stage2(num_classes=5)
             state2 = ckpt2['model_state_dict'] if isinstance(ckpt2, dict) and 'model_state_dict' in ckpt2 else ckpt2
             self.stage2_model.load_state_dict(state2, strict=False)
