@@ -38,7 +38,7 @@ async def analyze_xray(
 @router.post("/analyze-xray-direct")
 async def analyze_xray_direct(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),  # any authenticated user
+    current_user: User = Depends(get_current_user),
 ):
     """Analyze X-ray without attaching to a clinical profile. Available to all authenticated users."""
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -50,10 +50,12 @@ async def analyze_xray_direct(
     if result.get("status") == "error":
         raise HTTPException(status_code=500, detail=result.get("message", "Analysis failed"))
 
+    # Flat response — same shape as /analyze-xray so Flutter parser works without changes
     return {
         "message": "X-ray analysis completed",
-        "result": result,
-        "file_path": FileService.get_file_url(file_path),
+        "user_id": current_user.id,
+        "filename": file.filename,
+        **result,
     }
 
 
