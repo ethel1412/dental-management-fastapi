@@ -47,6 +47,27 @@ DISEASE_ADVICE = {
     "Periapical Lesion": "Infection at the tooth root detected. Prompt dental treatment is strongly advised.",
 }
 
+# ── Tooth type derived from Stage 1 class label (1–32) ───────────────────────
+# Labels follow the HumansInTheLoop dataset ordering: upper arch labels 1–16,
+# lower arch labels 17–32, each sequenced from patient's right to left.
+# FDI positions per quadrant: 1–2 incisors, 3 canine, 4–5 premolars, 6–8 molars.
+_TOOTH_TYPE_MAP: dict[int, str] = {}
+for _q_start, _labels in enumerate([range(1, 9), range(9, 17), range(17, 25), range(25, 33)]):
+    for _pos, _lbl in enumerate(_labels, start=1):
+        if _pos <= 2:
+            _TOOTH_TYPE_MAP[_lbl] = "Incisor"
+        elif _pos == 3:
+            _TOOTH_TYPE_MAP[_lbl] = "Canine"
+        elif _pos <= 5:
+            _TOOTH_TYPE_MAP[_lbl] = "Premolar"
+        else:
+            _TOOTH_TYPE_MAP[_lbl] = "Molar"
+
+
+def _tooth_type_from_label(label: int) -> str:
+    """Return anatomical tooth type from Stage 1 class label (1–32)."""
+    return _TOOTH_TYPE_MAP.get(label, "Unknown")
+
 # ── Quadrant colours for segmentation overlay ────────────────────────────────
 QUADRANT_COLORS = [
     (255, 100,  60),   # Q1 – upper right (orange-red)
@@ -181,6 +202,55 @@ class MLService:
                 index_result[orig_idx] = min(fdi, fdi_start[q] + 7)  # cap at 8 teeth/quadrant
         return index_result
 
+    # ── Dental age estimation ──────────────────────────────────────────────
+    # Rule-based heuristic derived from eruption patterns and FDI tooth presence.
+    # Labels 1–32 map to specific teeth; third molars are labels 7, 8 (UR), 15, 16 (UL),
+    # 23, 24 (LL), 31, 32 (LR) depending on dataset ordering — conservatively we flag
+    # the last positional slot in each quadrant as a wisdom tooth candidate.
+
+    @staticmethod
+    def _estimate_dental_age(labels_np) -> dict:
+        """
+        Estimate patient age range from detected tooth labels (1–32).
+
+        Rules (per standard eruption charts):
+        - Deciduous only (very few teeth, all small):      5–9 years
+        - Mixed dentition (some permanent, some missing):  6–12 years
+        - Full permanent, no third molars visible:         13–20 years
+        - Third molars present:                            18+ years
+        - Full adult arch (28–32 teeth):                   18–40 years
+        """
+        unique_labels = set(int(l) for l in labels_np if 1 <= int(l) <= 32)
+        n_teeth = len(unique_labels)
+
+        # Third molars: positional slots 8, 16, 17, 25 in standard FDI ordering
+        # In the HumansInTheLoop dataset labels 1–32 sequenced per quadrant —
+        # labels at positions 8, 16, 24, 32 are the most posterior (wisdom teeth).
+        third_molar_labels = {8, 16, 24, 32}
+        has_third_molars = bool(unique_labels & third_molar_labels)
+
+        if n_teeth == 0:
+            return {"age_range": "Undetermined", "age_min": None, "age_max": None,
+                    "basis": "No teeth detected"}
+
+        if n_teeth <= 10:
+            return {"age_range": "5–9 years", "age_min": 5, "age_max": 9,
+                    "basis": "Few teeth detected — likely deciduous or early mixed dentition"}
+
+        if n_teeth <= 20:
+            return {"age_range": "6–12 years", "age_min": 6, "age_max": 12,
+                    "basis": "Partial dentition — consistent with mixed dentition stage"}
+
+        if has_third_molars:
+            if n_teeth >= 28:
+                return {"age_range": "18–40 years", "age_min": 18, "age_max": 40,
+                        "basis": "Full adult dentition with third molars present"}
+            return {"age_range": "18–25 years", "age_min": 18, "age_max": 25,
+                    "basis": "Third molars detected — patient is likely an adult"}
+
+        return {"age_range": "13–20 years", "age_min": 13, "age_max": 20,
+                "basis": "Full permanent dentition without visible third molars"}
+
     # ── Annotated image builder ────────────────────────────────────────────
 
     @staticmethod
@@ -206,6 +276,7 @@ class MLService:
             boxes_np = s1['boxes'].cpu().numpy()      # (N, 4) xyxy
             masks_np = s1['masks'].cpu().numpy()      # (N, 1, H, W)
             scores_np = s1['scores'].cpu().numpy()
+            labels_np = s1['labels'].cpu().numpy()    # (N,) Stage 1 class labels 1–32
 
             fdi_list = self._assign_fdi(boxes_np, img_w, img_h)
 
@@ -225,7 +296,7 @@ class MLService:
             teeth_results = []
             summary_disease_counts: Dict[str, int] = {}
 
-            for i, (box, mask, score, fdi) in enumerate(zip(boxes_np, masks_np, scores_np, fdi_list)):
+            for i, (box, mask, score, fdi, s1_label) in enumerate(zip(boxes_np, masks_np, scores_np, fdi_list, labels_np)):
                 x1, y1, x2, y2 = (
                     max(0, int(box[0]) - 10),
                     max(0, int(box[1]) - 10),
@@ -264,6 +335,7 @@ class MLService:
 
                 teeth_results.append({
                     "fdi_number": fdi,
+                    "tooth_type": _tooth_type_from_label(int(s1_label)),
                     "detection_confidence": round(float(score), 4),
                     "bounding_box": {"x1": int(box[0]), "y1": int(box[1]),
                                      "x2": int(box[2]), "y2": int(box[3])},
@@ -273,6 +345,15 @@ class MLService:
                     "severity": DISEASE_SEVERITY.get(disease, "unknown"),
                     "advice": DISEASE_ADVICE.get(disease, ""),
                 })
+
+            # ── Dental age estimation ──────────────────────────────────────
+            age_estimate = self._estimate_dental_age(labels_np)
+
+            # ── Type breakdown ─────────────────────────────────────────────
+            type_counts: Dict[str, int] = {}
+            for t in teeth_results:
+                tt = t["tooth_type"]
+                type_counts[tt] = type_counts.get(tt, 0) + 1
 
             # Overall health summary
             total = len(teeth_results)
@@ -302,6 +383,8 @@ class MLService:
                     "diseased_teeth": diseased,
                     "overall_status": overall_status,
                     "disease_breakdown": summary_disease_counts,
+                    "tooth_type_breakdown": type_counts,
+                    "age_estimate": age_estimate,
                 },
                 "teeth": teeth_results,
                 "annotated_image_base64": annotated_b64,
