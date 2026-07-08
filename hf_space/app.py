@@ -1,5 +1,7 @@
 import os, json, io, base64
 import gradio as gr
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -190,7 +192,24 @@ def _run_inference(image_bytes: bytes) -> dict:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# ── Gradio UI wrapper ─────────────────────────────────────────────────────────────
+# ── 1. Create FastAPI app FIRST ──────────────────────────────────────────────────────────────
+app = FastAPI(title="Dental ML API")
+
+
+@app.post("/analyze")
+async def analyze_endpoint(file: UploadFile = File(...)):
+    """Plain REST endpoint — Render calls this directly."""
+    image_bytes = await file.read()
+    result = _run_inference(image_bytes)
+    return JSONResponse(content=result)
+
+
+@app.get("/health")
+async def health_endpoint():
+    return {"status": "ok", "loaded": _loaded}
+
+
+# ── 2. Build Gradio UI ──────────────────────────────────────────────────────────────────
 def analyze_gradio(image_input) -> str:
     try:
         if isinstance(image_input, dict):
@@ -209,41 +228,16 @@ def analyze_gradio(image_input) -> str:
 with gr.Blocks(title="Dental ML API") as demo:
     gr.Markdown("## Dental ML API\nUpload a dental X-ray to get JSON analysis.")
     with gr.Row():
-        img_input = gr.Image(type="filepath", label="Dental X-Ray")
+        img_input  = gr.Image(type="filepath", label="Dental X-Ray")
         txt_output = gr.Textbox(label="JSON Result", lines=20)
     gr.Button("Analyze").click(fn=analyze_gradio, inputs=img_input, outputs=txt_output)
 
 
-# ── Mount custom REST endpoints onto Gradio's FastAPI app ───────────────────────────
-# Gradio 5+ exposes demo.app (a Starlette/FastAPI app).
-# We add routes BEFORE launch so they're registered in the same server process.
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
+# ── 3. Mount Gradio onto FastAPI at root ────────────────────────────────────────────────────
+app = gr.mount_gradio_app(app, demo, path="/")
 
 
-async def analyze_endpoint(request: Request):
-    """POST /analyze — multipart file upload, returns JSON."""
-    try:
-        form = await request.form()
-        file_field = form.get("file")
-        if file_field is None:
-            return JSONResponse({"status": "error", "message": "No file field in form data"}, status_code=400)
-        image_bytes = await file_field.read()
-        result = _run_inference(image_bytes)
-        return JSONResponse(result)
-    except Exception as e:
-        import traceback
-        return JSONResponse({"status": "error", "message": str(e), "trace": traceback.format_exc()}, status_code=500)
-
-
-async def health_endpoint(request: Request):
-    return JSONResponse({"status": "ok", "loaded": _loaded})
-
-
-# Register routes on Gradio's internal app before launch
-demo.app.add_route("/analyze", analyze_endpoint, methods=["POST"])
-demo.app.add_route("/health",  health_endpoint,  methods=["GET"])
-
-# Launch — Gradio owns the server, no separate uvicorn.run needed
-demo.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
+# ── 4. Single uvicorn entry point ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
