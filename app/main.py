@@ -17,7 +17,6 @@ from app.routes import (
 from app.services.file_service import FileService
 from app.config import settings
 import os
-import shutil
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -25,64 +24,10 @@ Base.metadata.create_all(bind=engine)
 # Create upload directories
 FileService.ensure_upload_dirs()
 
-
-def download_models():
-    """Download ML model weights from Hugging Face Hub at startup.
-
-    hf_hub_download() returns the actual path where the file landed.
-    We copy it to the canonical path expected by settings so the rest
-    of the code never has to care about HF's cache directory layout.
-    """
-    from huggingface_hub import hf_hub_download
-
-    os.makedirs("app/ml_models", exist_ok=True)
-
-    HF_REPO = "ethelrani/dental-models"
-
-    if not os.path.exists(settings.STAGE1_MODEL_PATH):
-        print("Downloading Stage 1 model (Mask R-CNN) from Hugging Face...")
-        downloaded_path = hf_hub_download(
-            repo_id=HF_REPO,
-            filename="maskrcnn_teeth_best.pth",
-            local_dir="app/ml_models",
-            local_dir_use_symlinks=False,
-        )
-        # Ensure the file is at the canonical path
-        if os.path.abspath(downloaded_path) != os.path.abspath(settings.STAGE1_MODEL_PATH):
-            shutil.copy2(downloaded_path, settings.STAGE1_MODEL_PATH)
-        print(f"Stage 1 model ready at {settings.STAGE1_MODEL_PATH}")
-    else:
-        print("Stage 1 model already exists, skipping download.")
-
-    if not os.path.exists(settings.STAGE2_MODEL_PATH):
-        print("Downloading Stage 2 model (Disease Classifier) from Hugging Face...")
-        downloaded_path = hf_hub_download(
-            repo_id=HF_REPO,
-            filename="stage2_disease_best.pth",
-            local_dir="app/ml_models",
-            local_dir_use_symlinks=False,
-        )
-        if os.path.abspath(downloaded_path) != os.path.abspath(settings.STAGE2_MODEL_PATH):
-            shutil.copy2(downloaded_path, settings.STAGE2_MODEL_PATH)
-        print(f"Stage 2 model ready at {settings.STAGE2_MODEL_PATH}")
-    else:
-        print("Stage 2 model already exists, skipping download.")
-
-
-# ── Download models BEFORE MLService singleton is created ──────────────────
-try:
-    download_models()
-except Exception as e:
-    print(f"Warning: Could not download models at import time: {e}")
-    print("ML features will be unavailable until models are present.")
-
-# ── NOW import the ML service (models are on disk) ──────────────────────────
-from app.services.ml_service import ml_service  # noqa: E402
-
-# If models were just downloaded but singleton was somehow already created
-# with None models, reload them now.
-if ml_service.stage1_model is None or ml_service.stage2_model is None:
-    ml_service._load_models()
+# NOTE: ML models are NOT loaded at startup.
+# They are downloaded and loaded lazily on the first ML analysis request.
+# This keeps startup memory well under the 512MB Render free tier limit.
+# See app/services/ml_service.py for the lazy-load logic.
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -136,8 +81,9 @@ def health_check():
     return {
         "status": "healthy",
         "database": "connected",
-        "stage1_model": "loaded" if stage1 else "not found",
-        "stage2_model": "loaded" if stage2 else "not found",
+        "stage1_model": "on disk" if stage1 else "not downloaded yet",
+        "stage2_model": "on disk" if stage2 else "not downloaded yet",
+        "ml_note": "Models load lazily on first ML request to conserve memory"
     }
 
 
@@ -148,8 +94,7 @@ async def startup_event():
     print("=" * 50)
     print(f"API Docs: /api/docs")
     print(f"Upload Directory: {settings.UPLOAD_DIR}")
-    print(f"Stage 1 model: {'loaded' if ml_service.stage1_model else 'NOT LOADED'}")
-    print(f"Stage 2 model: {'loaded' if ml_service.stage2_model else 'NOT LOADED'}")
+    print("ML models will be loaded lazily on first analysis request.")
     print("=" * 50)
 
 
