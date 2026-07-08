@@ -2,3 +2,6 @@ huggingface_hub>=0.23.0
 opencv-python-headless
 Pillow
 numpy
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
