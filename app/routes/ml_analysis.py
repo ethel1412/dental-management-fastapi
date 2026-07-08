@@ -1,6 +1,7 @@
 import httpx
 import os
 import base64
+import json
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from app.models.user import User
 from app.utils.dependencies import get_current_user
@@ -22,54 +23,65 @@ def _check_space_configured():
 
 async def _proxy_analyze(file: UploadFile) -> dict:
     """
-    Forward the image to the HuggingFace Gradio Space using the /run/predict API.
-    Gradio expects the image as a base64 data URI.
+    Forward the image to the HuggingFace Gradio Space.
+    Tries Gradio 6.x path first (/gradio_api/run/predict),
+    falls back to legacy path (/run/predict).
     """
     _check_space_configured()
     image_bytes = await file.read()
 
-    # Gradio /run/predict requires image as base64 data URI
     content_type = file.content_type or "image/jpeg"
     b64 = base64.b64encode(image_bytes).decode()
     data_uri = f"data:{content_type};base64,{b64}"
-
     payload = {"data": [data_uri]}
 
+    # Gradio 6.x uses /gradio_api/run/predict, older uses /run/predict
+    endpoints = [
+        f"{HF_SPACE_URL}/gradio_api/run/predict",
+        f"{HF_SPACE_URL}/run/predict",
+    ]
+
+    last_error = None
     async with httpx.AsyncClient(timeout=300.0) as client:
-        try:
-            response = await client.post(
-                f"{HF_SPACE_URL}/run/predict",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-        except httpx.ConnectError:
-            raise HTTPException(
-                status_code=503,
-                detail="Could not connect to ML service. The Space may be waking up — please retry in 30 seconds.",
-            )
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail="ML service timed out. The models may still be loading — please retry.",
-            )
+        for endpoint in endpoints:
+            try:
+                response = await client.post(
+                    endpoint,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                if response.status_code == 200:
+                    break
+                last_error = f"[{endpoint}] HTTP {response.status_code}: {response.text[:200]}"
+            except httpx.ConnectError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not connect to ML service. The Space may be waking up — please retry in 30 seconds.",
+                )
+            except httpx.TimeoutException:
+                raise HTTPException(
+                    status_code=504,
+                    detail="ML service timed out. The models may still be loading — please retry.",
+                )
+        else:
+            raise HTTPException(status_code=502, detail=f"ML service error on all endpoints. Last: {last_error}")
 
     if response.status_code != 200:
         raise HTTPException(
             status_code=response.status_code,
-            detail=f"ML service error: {response.text[:300]}",
+            detail=f"ML service error: {response.text[:500]}",
         )
 
     # Gradio returns {"data": ["<json string>"]}
-    import json
     gradio_response = response.json()
     raw = gradio_response.get("data", [None])[0]
     if raw is None:
-        raise HTTPException(status_code=502, detail="Empty response from ML service.")
+        raise HTTPException(status_code=502, detail=f"Empty response from ML service. Full response: {str(gradio_response)[:300]}")
 
     try:
         result = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
-        raise HTTPException(status_code=502, detail=f"Could not parse ML response: {str(raw)[:200]}")
+        raise HTTPException(status_code=502, detail=f"Could not parse ML response: {str(raw)[:300]}")
 
     return result
 
@@ -119,11 +131,15 @@ async def get_model_info(current_user: User = Depends(get_current_user)):
     _check_space_configured()
     space_status = "unknown"
     async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            # Gradio exposes /info endpoint
-            response = await client.get(f"{HF_SPACE_URL}/info")
-            space_status = "running" if response.status_code == 200 else "unreachable"
-        except Exception:
+        for path in ["/gradio_api/info", "/info"]:
+            try:
+                response = await client.get(f"{HF_SPACE_URL}{path}")
+                if response.status_code == 200:
+                    space_status = "running"
+                    break
+            except Exception:
+                continue
+        else:
             space_status = "unreachable"
 
     return {
