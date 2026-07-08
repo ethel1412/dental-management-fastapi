@@ -1,4 +1,4 @@
-import os, json, io, base64, tempfile
+import os, json, io, base64
 import gradio as gr
 from huggingface_hub import hf_hub_download
 
@@ -188,7 +188,7 @@ def analyze(image_path: str) -> str:
                            "trace": traceback.format_exc()})
 
 
-# Gradio UI (required by HF Spaces)
+# Gradio UI — ssr_mode=False avoids Node.js proxy crash on free tier
 demo = gr.Interface(
     fn=analyze,
     inputs=gr.Image(type="filepath", label="Dental X-Ray"),
@@ -197,5 +197,4 @@ demo = gr.Interface(
     description="Internal API — upload a dental X-ray to get JSON analysis.",
 )
 
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+demo.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
