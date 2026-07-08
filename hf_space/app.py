@@ -65,6 +65,11 @@ def _ensure_loaded():
 
     try:
         m2 = torchvision.models.resnet34(weights=None)
+        m2.fc = __import__('torch.nn', fromlist=['nn']).Sequential(
+            __import__('torch.nn', fromlist=['nn']).Dropout(0.5),
+            __import__('torch.nn', fromlist=['nn']).Linear(m2.fc.in_features, 5)
+        )
+        import torch.nn as nn
         m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
         ckpt2  = torch.load(STAGE2_PATH, map_location=device, weights_only=False)
         state2 = ckpt2.get("model_state_dict", ckpt2) if isinstance(ckpt2, dict) else ckpt2
@@ -78,19 +83,36 @@ def _ensure_loaded():
     _loaded = True
 
 
-def analyze(image_path: str) -> str:
+def _resolve_image(image_input):
+    """
+    Gradio 4.x passes filepath string.
+    Gradio 5.x/6.x passes an ImageData dict like {"path": "/tmp/...", "url": "..."}.
+    Returns a PIL Image.
+    """
+    from PIL import Image
+    if isinstance(image_input, dict):
+        path = image_input.get("path") or image_input.get("url", "")
+        return Image.open(path).convert("RGB")
+    elif isinstance(image_input, str):
+        return Image.open(image_input).convert("RGB")
+    elif hasattr(image_input, 'convert'):  # already a PIL Image
+        return image_input.convert("RGB")
+    else:
+        raise ValueError(f"Unknown image input type: {type(image_input)}")
+
+
+def analyze(image_input) -> str:
     """Main inference — called by Gradio. Returns JSON string."""
     _ensure_loaded()
     if stage1_model is None:
         return json.dumps({"status": "error", "message": "Stage 1 model failed to load."})
     try:
         import torch, numpy as np, cv2
-        from PIL import Image
         import torchvision.transforms.functional as TF
         from torchvision.ops import nms
         from torchvision import transforms as T
 
-        pil = Image.open(image_path).convert("RGB")
+        pil = _resolve_image(image_input)
         W, H = pil.size
         t = TF.to_tensor(pil)
         with torch.no_grad():
@@ -166,7 +188,9 @@ def analyze(image_path: str) -> str:
                     "moderate_issues"   if diseased <= total*.5  else
                     "significant_issues")
 
-        out_pil = Image.fromarray(annotated[..., ::-1])
+        out_pil = __import__('PIL.Image', fromlist=['Image']).Image.fromarray(annotated[..., ::-1])
+        from PIL import Image as PILImage
+        out_pil = PILImage.fromarray(annotated[..., ::-1])
         buf = io.BytesIO(); out_pil.save(buf, format="JPEG", quality=88)
         b64 = base64.b64encode(buf.getvalue()).decode()
 
@@ -189,6 +213,7 @@ def analyze(image_path: str) -> str:
 
 
 # Gradio UI — ssr_mode=False avoids Node.js proxy crash on free tier
+# gr.Image type="filepath" still works in Gradio 5+/6.x
 demo = gr.Interface(
     fn=analyze,
     inputs=gr.Image(type="filepath", label="Dental X-Ray"),
