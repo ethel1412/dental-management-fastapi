@@ -1,5 +1,7 @@
 import os, json, io, base64
 import gradio as gr
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -40,7 +42,8 @@ def _ensure_loaded():
     global stage1_model, stage2_model, device, _loaded
     if _loaded:
         return
-    import torch, torchvision, torch.nn as nn
+    import torch, torchvision
+    import torch.nn as nn
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
     from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
@@ -64,12 +67,8 @@ def _ensure_loaded():
         print(f"[ML] Stage 1 error: {e}")
 
     try:
-        m2 = torchvision.models.resnet34(weights=None)
-        m2.fc = __import__('torch.nn', fromlist=['nn']).Sequential(
-            __import__('torch.nn', fromlist=['nn']).Dropout(0.5),
-            __import__('torch.nn', fromlist=['nn']).Linear(m2.fc.in_features, 5)
-        )
-        import torch.nn as nn
+        import torchvision.models as tvm
+        m2 = tvm.resnet34(weights=None)
         m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
         ckpt2  = torch.load(STAGE2_PATH, map_location=device, weights_only=False)
         state2 = ckpt2.get("model_state_dict", ckpt2) if isinstance(ckpt2, dict) else ckpt2
@@ -83,36 +82,19 @@ def _ensure_loaded():
     _loaded = True
 
 
-def _resolve_image(image_input):
-    """
-    Gradio 4.x passes filepath string.
-    Gradio 5.x/6.x passes an ImageData dict like {"path": "/tmp/...", "url": "..."}.
-    Returns a PIL Image.
-    """
-    from PIL import Image
-    if isinstance(image_input, dict):
-        path = image_input.get("path") or image_input.get("url", "")
-        return Image.open(path).convert("RGB")
-    elif isinstance(image_input, str):
-        return Image.open(image_input).convert("RGB")
-    elif hasattr(image_input, 'convert'):  # already a PIL Image
-        return image_input.convert("RGB")
-    else:
-        raise ValueError(f"Unknown image input type: {type(image_input)}")
-
-
-def analyze(image_input) -> str:
-    """Main inference — called by Gradio. Returns JSON string."""
+def _run_inference(image_bytes: bytes, content_type: str = "image/jpeg") -> dict:
+    """Core inference logic. Accepts raw image bytes, returns result dict."""
     _ensure_loaded()
     if stage1_model is None:
-        return json.dumps({"status": "error", "message": "Stage 1 model failed to load."})
+        return {"status": "error", "message": "Stage 1 model failed to load."}
     try:
         import torch, numpy as np, cv2
+        from PIL import Image
         import torchvision.transforms.functional as TF
         from torchvision.ops import nms
         from torchvision import transforms as T
 
-        pil = _resolve_image(image_input)
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         W, H = pil.size
         t = TF.to_tensor(pil)
         with torch.no_grad():
@@ -128,7 +110,6 @@ def analyze(image_input) -> str:
         scores = filt["scores"].cpu().numpy()
         labels = filt["labels"].cpu().numpy()
 
-        # FDI assignment
         mid_x, mid_y = W / 2, H / 2
         q_boxes = {1: [], 2: [], 3: [], 4: []}
         for i, b in enumerate(boxes):
@@ -188,13 +169,12 @@ def analyze(image_input) -> str:
                     "moderate_issues"   if diseased <= total*.5  else
                     "significant_issues")
 
-        out_pil = __import__('PIL.Image', fromlist=['Image']).Image.fromarray(annotated[..., ::-1])
         from PIL import Image as PILImage
         out_pil = PILImage.fromarray(annotated[..., ::-1])
         buf = io.BytesIO(); out_pil.save(buf, format="JPEG", quality=88)
         b64 = base64.b64encode(buf.getvalue()).decode()
 
-        return json.dumps({
+        return {
             "status": "success",
             "summary": {
                 "total_teeth_detected": total,
@@ -205,21 +185,56 @@ def analyze(image_input) -> str:
             },
             "teeth":                    teeth,
             "annotated_image_base64":   b64,
-        })
+        }
     except Exception as e:
         import traceback
-        return json.dumps({"status": "error", "message": str(e),
-                           "trace": traceback.format_exc()})
+        return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# Gradio UI — ssr_mode=False avoids Node.js proxy crash on free tier
-# gr.Image type="filepath" still works in Gradio 5+/6.x
+# ── Gradio UI (for human use) ─────────────────────────────────────────────────
+def analyze_gradio(image_input) -> str:
+    """Gradio wrapper — accepts filepath or dict from Gradio 5+/6.x."""
+    try:
+        if isinstance(image_input, dict):
+            path = image_input.get("path") or image_input.get("url", "")
+        elif isinstance(image_input, str):
+            path = image_input
+        else:
+            return json.dumps({"status": "error", "message": f"Unknown input type: {type(image_input)}"})
+        with open(path, "rb") as f:
+            image_bytes = f.read()
+        result = _run_inference(image_bytes)
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
 demo = gr.Interface(
-    fn=analyze,
+    fn=analyze_gradio,
     inputs=gr.Image(type="filepath", label="Dental X-Ray"),
     outputs=gr.Textbox(label="JSON Result"),
     title="Dental ML API",
     description="Internal API — upload a dental X-ray to get JSON analysis.",
 )
 
-demo.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
+# ── Mount plain FastAPI /analyze endpoint onto Gradio's app ────────────────
+# Render calls this directly — no Gradio predict API involved
+app = gr.mount_gradio_app(FastAPI(), demo, path="/")
+
+
+@app.post("/analyze")
+async def analyze_endpoint(file: UploadFile = File(...)):
+    """Plain REST endpoint for Render backend to call."""
+    image_bytes = await file.read()
+    result = _run_inference(image_bytes, file.content_type or "image/jpeg")
+    return JSONResponse(content=result)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "loaded": _loaded}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
