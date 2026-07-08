@@ -27,8 +27,14 @@ async def analyze_xray(
         raise HTTPException(status_code=400, detail="File must be an image (JPEG/PNG).")
 
     ml = _get_ml_service()
+    # Trigger lazy model download + load before checking if models are ready
+    ml._ensure_loaded()
+
     if not ml.stage1_model:
-        raise HTTPException(status_code=503, detail="Stage 1 model not loaded. Please try again in a few seconds.")
+        raise HTTPException(
+            status_code=503,
+            detail="Stage 1 model could not be loaded. Check server logs for details."
+        )
 
     file_path = await FileService.save_file(file, "xrays", "analysis")
     result = ml.analyze_xray(file_path)
@@ -54,8 +60,14 @@ async def analyze_xray_direct(
         raise HTTPException(status_code=400, detail="File must be an image (JPEG/PNG).")
 
     ml = _get_ml_service()
+    # Trigger lazy model download + load before checking if models are ready
+    ml._ensure_loaded()
+
     if not ml.stage1_model:
-        raise HTTPException(status_code=503, detail="Stage 1 model not loaded. Please try again in a few seconds.")
+        raise HTTPException(
+            status_code=503,
+            detail="Stage 1 model could not be loaded. Check server logs for details."
+        )
 
     file_path = await FileService.save_file(file, "xrays", "temp")
     result = ml.analyze_xray(file_path)
