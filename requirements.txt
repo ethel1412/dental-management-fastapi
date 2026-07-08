@@ -5,12 +5,15 @@ psycopg2-binary==2.9.10
 python-dotenv==1.0.1
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 python-multipart==0.0.20
-pydantic==2.10.6
 pydantic[email]==2.10.6
 pydantic-settings==2.7.1
 Pillow==11.0.0
 numpy==1.26.4
-opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
 huggingface_hub==0.23.0
 email-validator==2.2.0
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
