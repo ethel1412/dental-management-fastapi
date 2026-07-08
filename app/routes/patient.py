@@ -95,9 +95,13 @@ async def register_patient(
 
 
 @router.get("/profile", response_model=PatientResponse)
-def get_patient_profile(current_user: User = Depends(require_role([UserRole.PATIENT]))):
+def get_patient_profile(
+    current_user: User = Depends(require_role([UserRole.PATIENT])),
+    db: Session = Depends(get_db)
+):
     """Get current patient's profile"""
-    patient = current_user.patient_profile
+    # Query directly — avoids the backref list vs scalar ambiguity
+    patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
     if not patient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -113,7 +117,7 @@ def update_patient_profile(
     db: Session = Depends(get_db)
 ):
     """Update patient profile"""
-    patient = current_user.patient_profile
+    patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
     if not patient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -136,7 +140,7 @@ async def upload_profile_image(
     db: Session = Depends(get_db)
 ):
     """Upload patient profile image"""
-    patient = current_user.patient_profile
+    patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
     if not patient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -151,6 +155,22 @@ async def upload_profile_image(
         "message": "Profile image uploaded successfully",
         "file_path": FileService.get_file_url(file_path)
     }
+
+
+@router.get("/search", response_model=list[PatientResponse])
+def search_patients(
+    q: str = "",
+    current_user: User = Depends(require_role([UserRole.DOCTOR])),
+    db: Session = Depends(get_db)
+):
+    """Search patients by name or patient_id (doctor only)"""
+    query = db.query(Patient)
+    if q:
+        query = query.filter(
+            (Patient.full_name.ilike(f"%{q}%")) |
+            (Patient.patient_id.ilike(f"%{q}%"))
+        )
+    return query.limit(50).all()
 
 
 @router.get("/{patient_id}", response_model=PatientResponse)

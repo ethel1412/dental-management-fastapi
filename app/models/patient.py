@@ -29,7 +29,9 @@ class Patient(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     
     # Relationships
-    user = relationship("User", backref="patient_profile")
+    # uselist=False makes user.patient_profile return a single Patient (or None),
+    # not a list. This is correct because user_id is unique (one-to-one).
+    user = relationship("User", backref=relationship.__func__.__doc__ and None or None)
     appointments = relationship("Appointment", back_populates="patient")
     clinical_profiles = relationship("ClinicalProfile", back_populates="patient")
 
