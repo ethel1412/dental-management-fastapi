@@ -4,7 +4,6 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 
-# ── Paths ──────────────────────────────────────────────────────────────────
 STAGE1_PATH = "./ml_models/maskrcnn_teeth_best.pth"
 STAGE2_PATH = "./ml_models/stage2_disease_best.pth"
 HF_REPO     = "ethelrani/dental-models"
@@ -84,7 +83,6 @@ def _ensure_loaded():
 
 
 def _run_inference(image_bytes: bytes) -> dict:
-    """Core inference. Accepts raw image bytes, returns result dict."""
     _ensure_loaded()
     if stage1_model is None:
         return {"status": "error", "message": "Stage 1 model failed to load."}
@@ -172,7 +170,8 @@ def _run_inference(image_bytes: bytes) -> dict:
 
         from PIL import Image as PILImage
         out_pil = PILImage.fromarray(annotated[..., ::-1])
-        buf = io.BytesIO(); out_pil.save(buf, format="JPEG", quality=88)
+        buf = io.BytesIO()
+        out_pil.save(buf, format="JPEG", quality=88)
         b64 = base64.b64encode(buf.getvalue()).decode()
 
         return {
@@ -192,16 +191,8 @@ def _run_inference(image_bytes: bytes) -> dict:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# ── 1. Create FastAPI app FIRST ──────────────────────────────────────────────────────────────
+# ── FastAPI app with REST endpoints ──────────────────────────────────────────────────────
 app = FastAPI(title="Dental ML API")
-
-
-@app.post("/analyze")
-async def analyze_endpoint(file: UploadFile = File(...)):
-    """Plain REST endpoint — Render calls this directly."""
-    image_bytes = await file.read()
-    result = _run_inference(image_bytes)
-    return JSONResponse(content=result)
 
 
 @app.get("/health")
@@ -209,15 +200,20 @@ async def health_endpoint():
     return {"status": "ok", "loaded": _loaded}
 
 
-# ── 2. Build Gradio UI ──────────────────────────────────────────────────────────────────
+@app.post("/analyze")
+async def analyze_endpoint(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    result = _run_inference(image_bytes)
+    return JSONResponse(content=result)
+
+
+# ── Gradio UI mounted at /ui (keeps /analyze and /health free at root) ──────────────
 def analyze_gradio(image_input) -> str:
     try:
         if isinstance(image_input, dict):
             path = image_input.get("path") or image_input.get("url", "")
-        elif isinstance(image_input, str):
-            path = image_input
         else:
-            return json.dumps({"status": "error", "message": f"Unknown input type: {type(image_input)}"})
+            path = image_input
         with open(path, "rb") as f:
             image_bytes = f.read()
         return json.dumps(_run_inference(image_bytes))
@@ -233,11 +229,9 @@ with gr.Blocks(title="Dental ML API") as demo:
     gr.Button("Analyze").click(fn=analyze_gradio, inputs=img_input, outputs=txt_output)
 
 
-# ── 3. Mount Gradio onto FastAPI at root ────────────────────────────────────────────────────
-app = gr.mount_gradio_app(app, demo, path="/")
+# Mount Gradio at /ui — REST endpoints at root are unaffected
+app = gr.mount_gradio_app(app, demo, path="/ui")
 
-
-# ── 4. Single uvicorn entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)
