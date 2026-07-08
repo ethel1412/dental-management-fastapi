@@ -1,8 +1,9 @@
+"""Pure FastAPI ML inference server — no Gradio, no port conflicts."""
 import os, json, io, base64
-import gradio as gr
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from huggingface_hub import hf_hub_download
+import uvicorn
 
 STAGE1_PATH = "./ml_models/maskrcnn_teeth_best.pth"
 STAGE2_PATH = "./ml_models/stage2_disease_best.pth"
@@ -28,11 +29,11 @@ _loaded      = False
 def _download_models():
     os.makedirs("ml_models", exist_ok=True)
     if not os.path.exists(STAGE1_PATH):
-        print("[ML] Downloading Stage 1...")
+        print("[ML] Downloading Stage 1 model...")
         hf_hub_download(repo_id=HF_REPO, filename="maskrcnn_teeth_best.pth",
                         local_dir="ml_models", local_dir_use_symlinks=False)
     if not os.path.exists(STAGE2_PATH):
-        print("[ML] Downloading Stage 2...")
+        print("[ML] Downloading Stage 2 model...")
         hf_hub_download(repo_id=HF_REPO, filename="stage2_disease_best.pth",
                         local_dir="ml_models", local_dir_use_symlinks=False)
 
@@ -41,13 +42,12 @@ def _ensure_loaded():
     global stage1_model, stage2_model, device, _loaded
     if _loaded:
         return
-    import torch, torchvision
-    import torch.nn as nn
+    import torch, torchvision, torch.nn as nn
     from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
     from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 
     device = torch.device("cpu")
-    print(f"[ML] Device: {device}")
+    print(f"[ML] Using device: {device}")
     _download_models()
 
     try:
@@ -56,28 +56,27 @@ def _ensure_loaded():
             m.roi_heads.box_predictor.cls_score.in_features, 33)
         m.roi_heads.mask_predictor = MaskRCNNPredictor(
             m.roi_heads.mask_predictor.conv5_mask.in_channels, 256, 33)
-        ckpt  = torch.load(STAGE1_PATH, map_location=device, weights_only=False)
+        ckpt = torch.load(STAGE1_PATH, map_location=device, weights_only=False)
         state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         m.load_state_dict(state, strict=False)
         m.to(device).eval()
         stage1_model = m
-        print("[ML] Stage 1 loaded")
+        print("[ML] Stage 1 loaded OK")
     except Exception as e:
-        print(f"[ML] Stage 1 error: {e}")
+        print(f"[ML] Stage 1 load error: {e}")
 
     try:
         import torchvision.models as tvm
-        import torch.nn as nn
         m2 = tvm.resnet34(weights=None)
         m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
-        ckpt2  = torch.load(STAGE2_PATH, map_location=device, weights_only=False)
+        ckpt2 = torch.load(STAGE2_PATH, map_location=device, weights_only=False)
         state2 = ckpt2.get("model_state_dict", ckpt2) if isinstance(ckpt2, dict) else ckpt2
         m2.load_state_dict(state2, strict=False)
         m2.to(device).eval()
         stage2_model = m2
-        print("[ML] Stage 2 loaded")
+        print("[ML] Stage 2 loaded OK")
     except Exception as e:
-        print(f"[ML] Stage 2 error: {e}")
+        print(f"[ML] Stage 2 load error: {e}")
 
     _loaded = True
 
@@ -101,13 +100,12 @@ def _run_inference(image_bytes: bytes) -> dict:
         keep = raw["scores"] >= 0.5
         filt = {k: v[keep] for k, v in raw.items()}
         if len(filt["boxes"]) > 0:
-            idx  = nms(filt["boxes"], filt["scores"], 0.3)
+            idx = nms(filt["boxes"], filt["scores"], 0.3)
             filt = {k: v[idx] for k, v in filt.items()}
 
         boxes  = filt["boxes"].cpu().numpy()
         masks  = filt["masks"].cpu().numpy()
         scores = filt["scores"].cpu().numpy()
-        labels = filt["labels"].cpu().numpy()
 
         mid_x, mid_y = W / 2, H / 2
         q_boxes = {1: [], 2: [], 3: [], 4: []}
@@ -118,33 +116,33 @@ def _run_inference(image_bytes: bytes) -> dict:
         fdi_start = {1: 11, 2: 21, 3: 31, 4: 41}
         fdi_list  = [0] * len(boxes)
         for q, items in q_boxes.items():
-            for rank, (_, oi) in enumerate(sorted(items, key=lambda x: x[0], reverse=q in (2, 3))):
+            for rank, (_, oi) in enumerate(sorted(items, key=lambda x: x[0], reverse=q in (2,3))):
                 fdi_list[oi] = min(fdi_start[q] + rank, fdi_start[q] + 7)
 
         annotated = np.array(pil)[..., ::-1].copy()
-        cv2.line(annotated, (int(mid_x), 0),  (int(mid_x), H), (255,255,255), 2)
+        cv2.line(annotated, (int(mid_x), 0), (int(mid_x), H), (255,255,255), 2)
         cv2.line(annotated, (0, int(mid_y)), (W, int(mid_y)), (255,255,255), 2)
 
         tf = T.Compose([T.Resize((224,224)), T.ToTensor(),
                         T.Normalize([.485,.456,.406],[.229,.224,.225])])
         teeth, disease_counts = [], {}
 
-        for box, mask, score, fdi, lbl in zip(boxes, masks, scores, fdi_list, labels):
-            x1 = max(0, int(box[0])-10);  y1 = max(0, int(box[1])-10)
-            x2 = min(W, int(box[2])+10);  y2 = min(H, int(box[3])+10)
+        for box, mask, score, fdi in zip(boxes, masks, scores, fdi_list):
+            x1 = max(0, int(box[0])-10); y1 = max(0, int(box[1])-10)
+            x2 = min(W, int(box[2])+10); y2 = min(H, int(box[3])+10)
             crop = pil.crop((x1, y1, x2, y2))
             if stage2_model and crop.width > 4 and crop.height > 4:
                 with torch.no_grad():
-                    p  = torch.softmax(stage2_model(tf(crop).unsqueeze(0).to(device)), 1)[0].cpu().numpy()
+                    p = torch.softmax(stage2_model(tf(crop).unsqueeze(0).to(device)), 1)[0].cpu().numpy()
                 li = int(p.argmax())
                 cls_r = {"disease": DISEASE_CLASSES[li], "confidence": round(float(p[li]), 4)}
             else:
                 cls_r = {"disease": "Unknown", "confidence": 0.0}
 
-            d   = cls_r["disease"]
+            d = cls_r["disease"]
             col = DISEASE_COLORS_BGR.get(d, (128,128,128))
-            mb  = (mask[0] > 0.5).astype(np.uint8)
-            cl  = np.zeros_like(annotated); cl[mb == 1] = col
+            mb = (mask[0] > 0.5).astype(np.uint8)
+            cl = np.zeros_like(annotated); cl[mb == 1] = col
             annotated = cv2.addWeighted(annotated, 1.0, cl, 0.45, 0)
             cv2.rectangle(annotated, (x1,y1), (x2,y2), col, 2)
             cv2.putText(annotated, str(fdi), (x1+2, y1+16),
@@ -165,7 +163,7 @@ def _run_inference(image_bytes: bytes) -> dict:
         status   = ("no_teeth_detected" if total == 0 else
                     "all_healthy"       if diseased == 0 else
                     "mostly_healthy"    if diseased <= total*.25 else
-                    "moderate_issues"   if diseased <= total*.5  else
+                    "moderate_issues"   if diseased <= total*.5 else
                     "significant_issues")
 
         from PIL import Image as PILImage
@@ -183,55 +181,33 @@ def _run_inference(image_bytes: bytes) -> dict:
                 "overall_status":       status,
                 "disease_breakdown":    disease_counts,
             },
-            "teeth":                    teeth,
-            "annotated_image_base64":   b64,
+            "teeth":                  teeth,
+            "annotated_image_base64": b64,
         }
     except Exception as e:
         import traceback
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# ── FastAPI app with REST endpoints ──────────────────────────────────────────────────────
+# ── FastAPI ──────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Dental ML API")
 
 
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return "<h2>Dental ML API</h2><p>POST /analyze with a JPEG/PNG file field named <code>file</code>.</p>"
+
+
 @app.get("/health")
-async def health_endpoint():
+async def health():
     return {"status": "ok", "loaded": _loaded}
 
 
 @app.post("/analyze")
-async def analyze_endpoint(file: UploadFile = File(...)):
+async def analyze(file: UploadFile = File(...)):
     image_bytes = await file.read()
-    result = _run_inference(image_bytes)
-    return JSONResponse(content=result)
+    return JSONResponse(_run_inference(image_bytes))
 
-
-# ── Gradio UI mounted at /ui (keeps /analyze and /health free at root) ──────────────
-def analyze_gradio(image_input) -> str:
-    try:
-        if isinstance(image_input, dict):
-            path = image_input.get("path") or image_input.get("url", "")
-        else:
-            path = image_input
-        with open(path, "rb") as f:
-            image_bytes = f.read()
-        return json.dumps(_run_inference(image_bytes))
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-
-with gr.Blocks(title="Dental ML API") as demo:
-    gr.Markdown("## Dental ML API\nUpload a dental X-ray to get JSON analysis.")
-    with gr.Row():
-        img_input  = gr.Image(type="filepath", label="Dental X-Ray")
-        txt_output = gr.Textbox(label="JSON Result", lines=20)
-    gr.Button("Analyze").click(fn=analyze_gradio, inputs=img_input, outputs=txt_output)
-
-
-# Mount Gradio at /ui — REST endpoints at root are unaffected
-app = gr.mount_gradio_app(app, demo, path="/ui")
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)
