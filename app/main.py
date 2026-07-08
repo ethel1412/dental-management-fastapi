@@ -24,6 +24,50 @@ Base.metadata.create_all(bind=engine)
 # Create upload directories
 FileService.ensure_upload_dirs()
 
+
+def download_models():
+    """Download ML model weights from Hugging Face Hub at startup."""
+    from huggingface_hub import hf_hub_download
+
+    os.makedirs("app/ml_models", exist_ok=True)
+
+    HF_REPO = "ethelrani/dental-models"
+
+    if not os.path.exists(settings.STAGE1_MODEL_PATH):
+        print("Downloading Stage 1 model (Mask R-CNN) from Hugging Face...")
+        hf_hub_download(
+            repo_id=HF_REPO,
+            filename="maskrcnn_teeth_best.pth",
+            local_dir="app/ml_models"
+        )
+        print("Stage 1 model downloaded.")
+    else:
+        print("Stage 1 model already exists, skipping download.")
+
+    if not os.path.exists(settings.STAGE2_MODEL_PATH):
+        print("Downloading Stage 2 model (Disease Classifier) from Hugging Face...")
+        hf_hub_download(
+            repo_id=HF_REPO,
+            filename="stage2_disease_best.pth",
+            local_dir="app/ml_models"
+        )
+        print("Stage 2 model downloaded.")
+    else:
+        print("Stage 2 model already exists, skipping download.")
+
+
+# ── Download models BEFORE app/service initialisation ──────────────────────
+# ml_service is imported lazily inside the route module so that _load_models()
+# runs AFTER the .pth files are present on disk.
+try:
+    download_models()
+except Exception as e:
+    print(f"Warning: Could not download models at import time: {e}")
+    print("ML features will be unavailable until models are present.")
+
+# ── NOW import the ML service (models are on disk) ──────────────────────────
+from app.services.ml_service import ml_service  # noqa: E402
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Dental Management System API",
@@ -80,54 +124,19 @@ def health_check():
         "stage2_model": "loaded" if stage2 else "not found",
     }
 
-def download_models():
-    """Download ML model weights from Hugging Face Hub at startup."""
-    from huggingface_hub import hf_hub_download
 
-    os.makedirs("app/ml_models", exist_ok=True)
-
-    HF_REPO = "ethelrani/dental-models"
-
-    if not os.path.exists(settings.STAGE1_MODEL_PATH):
-        print("Downloading Stage 1 model (Mask R-CNN) from Hugging Face...")
-        hf_hub_download(
-            repo_id=HF_REPO,
-            filename="maskrcnn_teeth_best.pth",
-            local_dir="app/ml_models"
-        )
-        print("Stage 1 model downloaded.")
-    else:
-        print("Stage 1 model already exists, skipping download.")
-
-    if not os.path.exists(settings.STAGE2_MODEL_PATH):
-        print("Downloading Stage 2 model (Disease Classifier) from Hugging Face...")
-        hf_hub_download(
-            repo_id=HF_REPO,
-            filename="stage2_disease_best.pth",
-            local_dir="app/ml_models"
-        )
-        print("Stage 2 model downloaded.")
-    else:
-        print("Stage 2 model already exists, skipping download.")
-
-# Startup event
 @app.on_event("startup")
 async def startup_event():
     print("=" * 50)
     print("Dental Management System API Starting...")
     print("=" * 50)
-
-    try:
-        download_models()
-    except Exception as e:
-        print(f"Warning: Could not download models: {e}")
-        print("ML features will be unavailable until models are present.")
-
     print(f"API Docs: /api/docs")
     print(f"Upload Directory: {settings.UPLOAD_DIR}")
+    print(f"Stage 1 model: {'loaded' if ml_service.stage1_model else 'NOT LOADED'}")
+    print(f"Stage 2 model: {'loaded' if ml_service.stage2_model else 'NOT LOADED'}")
     print("=" * 50)
 
-# Shutdown event
+
 @app.on_event("shutdown")
 async def shutdown_event():
     print("Shutting down Dental Management System API...")

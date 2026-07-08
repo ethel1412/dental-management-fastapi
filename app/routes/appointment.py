@@ -21,7 +21,6 @@ def create_appointment(
     db: Session = Depends(get_db)
 ):
     """Create a new appointment"""
-    # Verify doctor exists
     doctor = db.query(Doctor).filter(Doctor.id == appointment_data.doctor_id).first()
     if not doctor:
         raise HTTPException(
@@ -29,7 +28,6 @@ def create_appointment(
             detail="Doctor not found"
         )
 
-    # Get patient
     patient = db.query(Patient).filter(Patient.user_id == current_user.id).first()
     if not patient:
         raise HTTPException(
@@ -55,16 +53,15 @@ def create_appointment(
     return new_appointment
 
 
-@router.get("", response_model=List[AppointmentResponse])
-def get_my_appointments(
-    appointment_status: Optional[AppointmentStatus] = Query(None, alias="status"),
+def _get_appointments_for_user(
+    current_user: User,
+    db: Session,
+    appointment_status: Optional[AppointmentStatus] = None,
     upcoming: bool = False,
     page: int = 1,
     per_page: int = 10,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
 ):
-    """Get appointments for current user"""
+    """Shared logic for fetching appointments for the current user."""
     query = db.query(Appointment)
 
     if current_user.role == UserRole.PATIENT:
@@ -100,9 +97,35 @@ def get_my_appointments(
     query = query.order_by(Appointment.appointment_date.asc())
 
     offset = (page - 1) * per_page
-    appointments = query.offset(offset).limit(per_page).all()
+    return query.offset(offset).limit(per_page).all()
 
-    return appointments
+
+@router.get("", response_model=List[AppointmentResponse])
+def get_my_appointments(
+    appointment_status: Optional[AppointmentStatus] = Query(None, alias="status"),
+    upcoming: bool = False,
+    page: int = 1,
+    per_page: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get appointments for current user (GET /api/appointments)"""
+    return _get_appointments_for_user(current_user, db, appointment_status, upcoming, page, per_page)
+
+
+# Named alias that Flutter currently calls: GET /api/appointments/my-appointments
+# MUST be declared BEFORE /{appointment_id} to avoid route conflict
+@router.get("/my-appointments", response_model=List[AppointmentResponse])
+def get_my_appointments_alias(
+    appointment_status: Optional[AppointmentStatus] = Query(None, alias="status"),
+    upcoming: bool = False,
+    page: int = 1,
+    per_page: int = 200,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Alias: GET /api/appointments/my-appointments — same as GET /api/appointments"""
+    return _get_appointments_for_user(current_user, db, appointment_status, upcoming, page, per_page)
 
 
 @router.get("/{appointment_id}", response_model=AppointmentResponse)
@@ -111,7 +134,7 @@ def get_appointment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get a specific appointment"""
+    """Get a specific appointment by ID"""
     appointment = db.query(Appointment).filter(Appointment.id == appointment_id).first()
     if not appointment:
         raise HTTPException(
