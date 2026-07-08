@@ -1,9 +1,11 @@
-"""Pure FastAPI ML inference server — no Gradio, no port conflicts."""
-import os, json, io, base64
+"""Dental ML API — pure FastAPI for HuggingFace Spaces.
+HF Spaces imports this module and serves `app` via its own ASGI runner.
+Do NOT call uvicorn.run() at module level.
+"""
+import os, io, base64
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse
 from huggingface_hub import hf_hub_download
-import uvicorn
 
 STAGE1_PATH = "./ml_models/maskrcnn_teeth_best.pth"
 STAGE2_PATH = "./ml_models/stage2_disease_best.pth"
@@ -189,13 +191,14 @@ def _run_inference(image_bytes: bytes) -> dict:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# ── FastAPI ──────────────────────────────────────────────────────────────────────────
+# HF Spaces imports this module and serves `app` via its own ASGI runner.
+# Do NOT call uvicorn.run() at module level — HF starts the server itself.
 app = FastAPI(title="Dental ML API")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return "<h2>Dental ML API</h2><p>POST /analyze with a JPEG/PNG file field named <code>file</code>.</p>"
+    return "<h2>Dental ML API is running</h2><p>POST /analyze with field <code>file</code>. GET /health for status.</p>"
 
 
 @app.get("/health")
@@ -205,9 +208,4 @@ async def health():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    return JSONResponse(_run_inference(image_bytes))
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    return JSONResponse(_run_inference(await file.read()))
