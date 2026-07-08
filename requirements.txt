@@ -16,4 +16,5 @@ huggingface_hub==0.23.0
 email-validator==2.2.0
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
+sib-api-v3-sdk==7.6.0
 --extra-index-url https://download.pytorch.org/whl/cpu
