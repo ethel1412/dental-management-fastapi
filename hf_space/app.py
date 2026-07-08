@@ -1,7 +1,5 @@
 import os, json, io, base64
 import gradio as gr
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -68,6 +66,7 @@ def _ensure_loaded():
 
     try:
         import torchvision.models as tvm
+        import torch.nn as nn
         m2 = tvm.resnet34(weights=None)
         m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
         ckpt2  = torch.load(STAGE2_PATH, map_location=device, weights_only=False)
@@ -82,8 +81,8 @@ def _ensure_loaded():
     _loaded = True
 
 
-def _run_inference(image_bytes: bytes, content_type: str = "image/jpeg") -> dict:
-    """Core inference logic. Accepts raw image bytes, returns result dict."""
+def _run_inference(image_bytes: bytes) -> dict:
+    """Core inference. Accepts raw image bytes, returns result dict."""
     _ensure_loaded()
     if stage1_model is None:
         return {"status": "error", "message": "Stage 1 model failed to load."}
@@ -191,9 +190,8 @@ def _run_inference(image_bytes: bytes, content_type: str = "image/jpeg") -> dict
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# ── Gradio UI (for human use) ─────────────────────────────────────────────────
+# ── Gradio UI wrapper ─────────────────────────────────────────────────────────────
 def analyze_gradio(image_input) -> str:
-    """Gradio wrapper — accepts filepath or dict from Gradio 5+/6.x."""
     try:
         if isinstance(image_input, dict):
             path = image_input.get("path") or image_input.get("url", "")
@@ -203,38 +201,49 @@ def analyze_gradio(image_input) -> str:
             return json.dumps({"status": "error", "message": f"Unknown input type: {type(image_input)}"})
         with open(path, "rb") as f:
             image_bytes = f.read()
-        result = _run_inference(image_bytes)
-        return json.dumps(result)
+        return json.dumps(_run_inference(image_bytes))
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-demo = gr.Interface(
-    fn=analyze_gradio,
-    inputs=gr.Image(type="filepath", label="Dental X-Ray"),
-    outputs=gr.Textbox(label="JSON Result"),
-    title="Dental ML API",
-    description="Internal API — upload a dental X-ray to get JSON analysis.",
-)
-
-# ── Mount plain FastAPI /analyze endpoint onto Gradio's app ────────────────
-# Render calls this directly — no Gradio predict API involved
-app = gr.mount_gradio_app(FastAPI(), demo, path="/")
+with gr.Blocks(title="Dental ML API") as demo:
+    gr.Markdown("## Dental ML API\nUpload a dental X-ray to get JSON analysis.")
+    with gr.Row():
+        img_input = gr.Image(type="filepath", label="Dental X-Ray")
+        txt_output = gr.Textbox(label="JSON Result", lines=20)
+    gr.Button("Analyze").click(fn=analyze_gradio, inputs=img_input, outputs=txt_output)
 
 
-@app.post("/analyze")
-async def analyze_endpoint(file: UploadFile = File(...)):
-    """Plain REST endpoint for Render backend to call."""
-    image_bytes = await file.read()
-    result = _run_inference(image_bytes, file.content_type or "image/jpeg")
-    return JSONResponse(content=result)
+# ── Mount custom REST endpoints onto Gradio's FastAPI app ───────────────────────────
+# Gradio 5+ exposes demo.app (a Starlette/FastAPI app).
+# We add routes BEFORE launch so they're registered in the same server process.
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "loaded": _loaded}
+async def analyze_endpoint(request: Request):
+    """POST /analyze — multipart file upload, returns JSON."""
+    try:
+        form = await request.form()
+        file_field = form.get("file")
+        if file_field is None:
+            return JSONResponse({"status": "error", "message": "No file field in form data"}, status_code=400)
+        image_bytes = await file_field.read()
+        result = _run_inference(image_bytes)
+        return JSONResponse(result)
+    except Exception as e:
+        import traceback
+        return JSONResponse({"status": "error", "message": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+async def health_endpoint(request: Request):
+    return JSONResponse({"status": "ok", "loaded": _loaded})
+
+
+# Register routes on Gradio's internal app before launch
+demo.app.add_route("/analyze", analyze_endpoint, methods=["POST"])
+demo.app.add_route("/health",  health_endpoint,  methods=["GET"])
+
+# Launch — Gradio owns the server, no separate uvicorn.run needed
+demo.launch(server_name="0.0.0.0", server_port=7860, ssr_mode=False)
