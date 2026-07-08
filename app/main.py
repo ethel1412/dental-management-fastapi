@@ -17,6 +17,7 @@ from app.routes import (
 from app.services.file_service import FileService
 from app.config import settings
 import os
+import shutil
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -26,7 +27,12 @@ FileService.ensure_upload_dirs()
 
 
 def download_models():
-    """Download ML model weights from Hugging Face Hub at startup."""
+    """Download ML model weights from Hugging Face Hub at startup.
+
+    hf_hub_download() returns the actual path where the file landed.
+    We copy it to the canonical path expected by settings so the rest
+    of the code never has to care about HF's cache directory layout.
+    """
     from huggingface_hub import hf_hub_download
 
     os.makedirs("app/ml_models", exist_ok=True)
@@ -35,30 +41,35 @@ def download_models():
 
     if not os.path.exists(settings.STAGE1_MODEL_PATH):
         print("Downloading Stage 1 model (Mask R-CNN) from Hugging Face...")
-        hf_hub_download(
+        downloaded_path = hf_hub_download(
             repo_id=HF_REPO,
             filename="maskrcnn_teeth_best.pth",
-            local_dir="app/ml_models"
+            local_dir="app/ml_models",
+            local_dir_use_symlinks=False,
         )
-        print("Stage 1 model downloaded.")
+        # Ensure the file is at the canonical path
+        if os.path.abspath(downloaded_path) != os.path.abspath(settings.STAGE1_MODEL_PATH):
+            shutil.copy2(downloaded_path, settings.STAGE1_MODEL_PATH)
+        print(f"Stage 1 model ready at {settings.STAGE1_MODEL_PATH}")
     else:
         print("Stage 1 model already exists, skipping download.")
 
     if not os.path.exists(settings.STAGE2_MODEL_PATH):
         print("Downloading Stage 2 model (Disease Classifier) from Hugging Face...")
-        hf_hub_download(
+        downloaded_path = hf_hub_download(
             repo_id=HF_REPO,
             filename="stage2_disease_best.pth",
-            local_dir="app/ml_models"
+            local_dir="app/ml_models",
+            local_dir_use_symlinks=False,
         )
-        print("Stage 2 model downloaded.")
+        if os.path.abspath(downloaded_path) != os.path.abspath(settings.STAGE2_MODEL_PATH):
+            shutil.copy2(downloaded_path, settings.STAGE2_MODEL_PATH)
+        print(f"Stage 2 model ready at {settings.STAGE2_MODEL_PATH}")
     else:
         print("Stage 2 model already exists, skipping download.")
 
 
-# ── Download models BEFORE app/service initialisation ──────────────────────
-# ml_service is imported lazily inside the route module so that _load_models()
-# runs AFTER the .pth files are present on disk.
+# ── Download models BEFORE MLService singleton is created ──────────────────
 try:
     download_models()
 except Exception as e:
@@ -67,6 +78,11 @@ except Exception as e:
 
 # ── NOW import the ML service (models are on disk) ──────────────────────────
 from app.services.ml_service import ml_service  # noqa: E402
+
+# If models were just downloaded but singleton was somehow already created
+# with None models, reload them now.
+if ml_service.stage1_model is None or ml_service.stage2_model is None:
+    ml_service._load_models()
 
 # Initialize FastAPI app
 app = FastAPI(
