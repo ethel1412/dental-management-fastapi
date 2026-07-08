@@ -7,8 +7,10 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.20
 pydantic==2.10.6
+pydantic[email]==2.10.6
 pydantic-settings==2.7.1
 Pillow==11.0.0
 numpy==2.2.1
 opencv-python==4.10.0.84
 huggingface_hub==0.23.0
+email-validator==2.2.0
