@@ -1,9 +1,4 @@
-"""Dental ML API — ZeroGPU Gradio Space.
-Rules:
-  - import spaces must be present
-  - @spaces.GPU must decorate the inference function
-  - demo.launch() is the entrypoint (no uvicorn, no FastAPI)
-"""
+"""Dental ML API — ZeroGPU Gradio Space."""
 import os, io, base64
 import gradio as gr
 import spaces
@@ -34,11 +29,11 @@ def _download_models():
     if not os.path.exists(STAGE1_PATH):
         print("[ML] Downloading Stage 1 model...")
         hf_hub_download(repo_id=HF_REPO, filename="maskrcnn_teeth_best.pth",
-                        local_dir="ml_models", local_dir_use_symlinks=False)
+                        local_dir="ml_models")
     if not os.path.exists(STAGE2_PATH):
         print("[ML] Downloading Stage 2 model...")
         hf_hub_download(repo_id=HF_REPO, filename="stage2_disease_best.pth",
-                        local_dir="ml_models", local_dir_use_symlinks=False)
+                        local_dir="ml_models")
 
 
 def _load_models(device):
@@ -67,12 +62,10 @@ def _load_models(device):
         print(f"[ML] Stage 1 error: {e}")
 
     try:
+        import torch, torchvision, torch.nn as nn
         m2 = torchvision.models.resnet34(weights=None)
-        m2.fc = __import__("torch").nn.Sequential(
-            __import__("torch").nn.Dropout(0.5),
-            __import__("torch").nn.Linear(m2.fc.in_features, 5)
-        )
-        ckpt2 = __import__("torch").load(STAGE2_PATH, map_location="cpu", weights_only=False)
+        m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
+        ckpt2 = torch.load(STAGE2_PATH, map_location="cpu", weights_only=False)
         state2 = ckpt2.get("model_state_dict", ckpt2) if isinstance(ckpt2, dict) else ckpt2
         m2.load_state_dict(state2, strict=False)
         m2.eval().to(device)
@@ -84,9 +77,8 @@ def _load_models(device):
     _loaded = True
 
 
-@spaces.GPU
+@spaces.GPU(duration=60)
 def analyze(pil_image):
-    """ZeroGPU inference — GPU allocated for the duration of this call."""
     import json, torch, numpy as np, cv2
     from PIL import Image
     import torchvision.transforms.functional as TF
@@ -99,11 +91,7 @@ def analyze(pil_image):
     if stage1_model is None:
         return json.dumps({"status": "error", "message": "Stage 1 model failed to load."})
 
-    buf = io.BytesIO()
-    pil_image.save(buf, format="JPEG")
-    image_bytes = buf.getvalue()
-
-    pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pil = pil_image.convert("RGB")
     W, H = pil.size
     t = TF.to_tensor(pil).to(device)
 
@@ -208,17 +196,16 @@ def analyze(pil_image):
     }, indent=2)
 
 
-# ── Gradio UI + launch ────────────────────────────────────────────────────────
 demo = gr.Interface(
     fn=analyze,
     inputs=gr.Image(type="pil", label="Upload Dental X-ray (JPEG/PNG)"),
     outputs=gr.Textbox(label="Analysis Result (JSON)", lines=30),
-    title="🦷 Dental X-ray Analysis",
+    title="\U0001f9b7 Dental X-ray Analysis",
     description=(
-        "**Stage 1** — Mask R-CNN: detects & segments teeth, assigns FDI numbers.\n"
-        "**Stage 2** — ResNet-34: classifies Healthy / Caries / Deep Caries / Impacted / Periapical Lesion."
+        "**Stage 1** \u2014 Mask R-CNN: detects & segments teeth, assigns FDI numbers.\n"
+        "**Stage 2** \u2014 ResNet-34: classifies Healthy / Caries / Deep Caries / Impacted / Periapical Lesion."
     ),
     allow_flagging="never",
 )
 
-demo.launch()
+demo.launch(share=True)
