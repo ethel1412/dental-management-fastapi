@@ -3,9 +3,6 @@ Uses @spaces.GPU so inference runs on A100 (free ZeroGPU).
 Also exposes POST /analyze as a REST endpoint for the Render backend proxy.
 """
 # ── Patch huggingface_hub BEFORE gradio import ───────────────────────────────
-# ZeroGPU base image ships huggingface_hub>=1.0 which removed HfFolder,
-# but the base image also force-installs gradio[oauth]==4.44.0 which still
-# imports HfFolder. This patch stubs it out so gradio loads cleanly.
 import huggingface_hub as _hfhub
 if not hasattr(_hfhub, 'HfFolder'):
     class _FakeHfFolder:
@@ -20,9 +17,9 @@ if not hasattr(_hfhub, 'HfFolder'):
 import os, io, base64
 import gradio as gr
 import spaces
-from huggingface_hub import hf_hub_download
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
-from fastapi import UploadFile, File
+from huggingface_hub import hf_hub_download
 
 STAGE1_PATH = "./ml_models/maskrcnn_teeth_best.pth"
 STAGE2_PATH = "./ml_models/stage2_disease_best.pth"
@@ -68,7 +65,6 @@ def _ensure_loaded():
 
     _download_models()
 
-    # Stage 1 — Mask R-CNN (33 classes)
     try:
         m = torchvision.models.detection.maskrcnn_resnet50_fpn(weights=None)
         m.roi_heads.box_predictor = FastRCNNPredictor(
@@ -84,7 +80,6 @@ def _ensure_loaded():
     except Exception as e:
         print(f"[ML] Stage 1 load error: {e}")
 
-    # Stage 2 — ResNet-34 (5 disease classes)
     try:
         m2 = torchvision.models.resnet34(weights=None)
         m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
@@ -136,7 +131,6 @@ def _run_inference(image_bytes: bytes) -> dict:
     masks  = filt["masks"].cpu().numpy()
     scores = filt["scores"].cpu().numpy()
 
-    # FDI quadrant assignment
     mid_x, mid_y = W / 2, H / 2
     q_boxes = {1: [], 2: [], 3: [], 4: []}
     for i, b in enumerate(boxes):
@@ -149,7 +143,6 @@ def _run_inference(image_bytes: bytes) -> dict:
         for rank, (_, oi) in enumerate(sorted(items, key=lambda x: x[0], reverse=q in (2, 3))):
             fdi_list[oi] = min(fdi_start[q] + rank, fdi_start[q] + 7)
 
-    # Annotate image
     annotated = np.array(pil)[..., ::-1].copy()
     cv2.line(annotated, (int(mid_x), 0), (int(mid_x), H), (255, 255, 255), 2)
     cv2.line(annotated, (0, int(mid_y)), (W, int(mid_y)), (255, 255, 255), 2)
@@ -239,7 +232,7 @@ def _run_inference(image_bytes: bytes) -> dict:
     }
 
 
-# ── Gradio UI wrapper ────────────────────────────────────────────────────────
+# ── Gradio UI ────────────────────────────────────────────────────────────────
 def gradio_analyze(pil_image):
     buf = io.BytesIO()
     pil_image.save(buf, format="JPEG")
@@ -261,10 +254,10 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
-# HF Spaces manages the server — do NOT call demo.launch() here.
-# Expose the ASGI app for uvicorn and mount extra FastAPI routes on it.
-app = demo.app
-
+# ── FastAPI app — mount Gradio onto it ───────────────────────────────────────
+# gr.mount_gradio_app is the correct pattern for gradio 4.x in HF Spaces.
+# demo.app is only available AFTER demo.launch() which we must NOT call here.
+app = FastAPI()
 
 @app.post("/analyze")
 async def analyze_api(file: UploadFile = File(...)):
@@ -272,7 +265,8 @@ async def analyze_api(file: UploadFile = File(...)):
     result = _run_inference(image_bytes)
     return JSONResponse(result)
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "loaded": _loaded}
+
+app = gr.mount_gradio_app(app, demo, path="/")
