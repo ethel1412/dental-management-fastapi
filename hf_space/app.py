@@ -2,6 +2,21 @@
 Uses @spaces.GPU so inference runs on A100 (free ZeroGPU).
 Also exposes POST /analyze as a REST endpoint for the Render backend proxy.
 """
+# ── Patch huggingface_hub BEFORE gradio import ───────────────────────────────
+# ZeroGPU base image ships huggingface_hub>=1.0 which removed HfFolder,
+# but the base image also force-installs gradio[oauth]==4.44.0 which still
+# imports HfFolder. This patch stubs it out so gradio loads cleanly.
+import huggingface_hub as _hfhub
+if not hasattr(_hfhub, 'HfFolder'):
+    class _FakeHfFolder:
+        @staticmethod
+        def get_token(): return None
+        @staticmethod
+        def save_token(token): pass
+        @staticmethod
+        def delete_token(): pass
+    _hfhub.HfFolder = _FakeHfFolder
+
 import os, io, base64
 import gradio as gr
 import spaces
@@ -226,7 +241,6 @@ def _run_inference(image_bytes: bytes) -> dict:
 
 # ── Gradio UI wrapper ────────────────────────────────────────────────────────
 def gradio_analyze(pil_image):
-    """Gradio-facing function — receives PIL image, returns JSON string."""
     buf = io.BytesIO()
     pil_image.save(buf, format="JPEG")
     result = _run_inference(buf.getvalue())
@@ -238,7 +252,7 @@ demo = gr.Interface(
     fn=gradio_analyze,
     inputs=gr.Image(type="pil", label="Upload Dental X-ray (JPEG/PNG)"),
     outputs=gr.Textbox(label="Analysis Result (JSON)", lines=30),
-    title="🦷 Dental X-ray Analysis API",
+    title="\U0001f9b7 Dental X-ray Analysis API",
     description=(
         "**Stage 1** — Mask R-CNN (ResNet-50 FPN): detects & segments teeth, assigns FDI numbers.\n"
         "**Stage 2** — ResNet-34: classifies each tooth as Healthy / Caries / Deep Caries / Impacted / Periapical Lesion.\n\n"
@@ -247,8 +261,6 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
-# ── Mount REST endpoint on Gradio's internal FastAPI app ─────────────────────
-# Render backend proxies to POST /analyze — this keeps ml_analysis.py unchanged.
 app = demo.app
 
 
