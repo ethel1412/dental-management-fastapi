@@ -1,3 +1,4 @@
+gradio_client==0.6.0
 spaces
 opencv-python-headless
 Pillow

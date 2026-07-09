@@ -261,6 +261,8 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
+# HF Spaces manages the server — do NOT call demo.launch() here.
+# Expose the ASGI app for uvicorn and mount extra FastAPI routes on it.
 app = demo.app
 
 
@@ -274,7 +276,3 @@ async def analyze_api(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "loaded": _loaded}
-
-
-if __name__ == "__main__":
-    demo.launch(server_port=7860)
