@@ -1,12 +1,15 @@
-import httpx
 import os
+import json
+import tempfile
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from app.models.user import User
 from app.utils.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/ml-analysis", tags=["ML Analysis"])
 
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "").rstrip("/")
+HF_TOKEN = os.getenv("HF_TOKEN")  # only needed if the Space is private
 
 
 def _check_space_configured():
@@ -17,38 +20,65 @@ def _check_space_configured():
         )
 
 
+def _get_client():
+    """
+    Lazily import + construct gradio_client.Client.
+    Deferred import keeps gradio_client's own deps off the FastAPI cold-start path.
+    """
+    from gradio_client import Client
+    return Client(HF_SPACE_URL, hf_token=HF_TOKEN) if HF_TOKEN else Client(HF_SPACE_URL)
+
+
+def _predict_sync(tmp_path: str) -> dict:
+    """
+    Blocking call — gradio_client is synchronous. Always call this via
+    run_in_threadpool from an async route, never directly, or it will
+    block the whole event loop for the duration of the HF Space's
+    inference (which can be 10-60s on ZeroGPU cold start).
+    """
+    from gradio_client import handle_file
+    client = _get_client()
+    result = client.predict(
+        handle_file(tmp_path),
+        api_name="/predict",
+    )
+    # The Space's gradio_analyze() returns a JSON string (see hf_space/app.py)
+    return json.loads(result)
+
+
 async def _proxy_analyze(file: UploadFile) -> dict:
-    """
-    Forward the image to the HuggingFace Space plain REST /analyze endpoint.
-    Simple multipart upload — no Gradio predict API involved.
-    """
     _check_space_configured()
     image_bytes = await file.read()
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    suffix = os.path.splitext(file.filename or "xray.jpg")[1] or ".jpg"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+
+    try:
         try:
-            response = await client.post(
-                f"{HF_SPACE_URL}/analyze",
-                files={"file": (file.filename or "xray.jpg", image_bytes, file.content_type or "image/jpeg")},
-            )
-        except httpx.ConnectError:
+            result = await run_in_threadpool(_predict_sync, tmp_path)
+        except Exception as e:
+            # Cold-start / queue timeouts on ZeroGPU show up as generic
+            # exceptions from gradio_client, not clean HTTP status codes —
+            # normalize them into a retryable 503 rather than a raw 500.
             raise HTTPException(
                 status_code=503,
-                detail="Could not connect to ML service. The Space may be waking up — please retry in 30 seconds.",
+                detail=f"ML service unavailable or still starting up — please retry in 30-60s. ({e})",
             )
-        except httpx.TimeoutException:
-            raise HTTPException(
-                status_code=504,
-                detail="ML service timed out. The models may still be loading — please retry.",
-            )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
-    if response.status_code != 200:
+    if not isinstance(result, dict) or result.get("status") == "error":
         raise HTTPException(
-            status_code=response.status_code,
-            detail=f"ML service error: {response.text[:500]}",
+            status_code=502,
+            detail=f"ML service returned an error: {result.get('message', 'unknown error') if isinstance(result, dict) else result}",
         )
 
-    return response.json()
+    return result
 
 
 @router.post("/analyze-xray")
@@ -87,12 +117,11 @@ async def analyze_xray_direct(
 async def get_model_info(current_user: User = Depends(get_current_user)):
     _check_space_configured()
     space_status = "unknown"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(f"{HF_SPACE_URL}/health")
-            space_status = "running" if response.status_code == 200 else "unreachable"
-        except Exception:
-            space_status = "unreachable"
+    try:
+        await run_in_threadpool(_get_client)
+        space_status = "reachable"
+    except Exception:
+        space_status = "unreachable"
     return {
         "stage1": {"name": "Mask R-CNN (ResNet-50 FPN)", "classes": 33},
         "stage2": {"name": "ResNet-34 disease classifier",
