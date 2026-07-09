@@ -1,10 +1,12 @@
-"""Dental ML API — Gradio + FastAPI for HuggingFace Spaces (CPU).
-Exposes POST /analyze as a REST endpoint and a Gradio UI at /.
+"""Dental ML API — ZeroGPU Gradio Space.
+Rules:
+  - import spaces must be present
+  - @spaces.GPU must decorate the inference function
+  - demo.launch() is the entrypoint (no uvicorn, no FastAPI)
 """
-import os, io, base64, uvicorn
+import os, io, base64
 import gradio as gr
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+import spaces
 from huggingface_hub import hf_hub_download
 
 STAGE1_PATH = "./ml_models/maskrcnn_teeth_best.pth"
@@ -30,18 +32,16 @@ _loaded      = False
 def _download_models():
     os.makedirs("ml_models", exist_ok=True)
     if not os.path.exists(STAGE1_PATH):
-        print("[ML] Downloading Stage 1 model (Mask R-CNN)...")
+        print("[ML] Downloading Stage 1 model...")
         hf_hub_download(repo_id=HF_REPO, filename="maskrcnn_teeth_best.pth",
                         local_dir="ml_models", local_dir_use_symlinks=False)
-        print("[ML] Stage 1 downloaded.")
     if not os.path.exists(STAGE2_PATH):
-        print("[ML] Downloading Stage 2 model (ResNet-34)...")
+        print("[ML] Downloading Stage 2 model...")
         hf_hub_download(repo_id=HF_REPO, filename="stage2_disease_best.pth",
                         local_dir="ml_models", local_dir_use_symlinks=False)
-        print("[ML] Stage 2 downloaded.")
 
 
-def _ensure_loaded():
+def _load_models(device):
     global stage1_model, stage2_model, _loaded
     if _loaded:
         return
@@ -60,41 +60,48 @@ def _ensure_loaded():
         ckpt = torch.load(STAGE1_PATH, map_location="cpu", weights_only=False)
         state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
         m.load_state_dict(state, strict=False)
-        m.eval()
+        m.eval().to(device)
         stage1_model = m
-        print("[ML] Stage 1 (Mask R-CNN) loaded OK")
+        print("[ML] Stage 1 loaded OK")
     except Exception as e:
-        print(f"[ML] Stage 1 load error: {e}")
+        print(f"[ML] Stage 1 error: {e}")
 
     try:
         m2 = torchvision.models.resnet34(weights=None)
-        m2.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(m2.fc.in_features, 5))
-        ckpt2 = torch.load(STAGE2_PATH, map_location="cpu", weights_only=False)
+        m2.fc = __import__("torch").nn.Sequential(
+            __import__("torch").nn.Dropout(0.5),
+            __import__("torch").nn.Linear(m2.fc.in_features, 5)
+        )
+        ckpt2 = __import__("torch").load(STAGE2_PATH, map_location="cpu", weights_only=False)
         state2 = ckpt2.get("model_state_dict", ckpt2) if isinstance(ckpt2, dict) else ckpt2
         m2.load_state_dict(state2, strict=False)
-        m2.eval()
+        m2.eval().to(device)
         stage2_model = m2
-        print("[ML] Stage 2 (ResNet-34) loaded OK")
+        print("[ML] Stage 2 loaded OK")
     except Exception as e:
-        print(f"[ML] Stage 2 load error: {e}")
+        print(f"[ML] Stage 2 error: {e}")
 
     _loaded = True
 
 
-def _run_inference(image_bytes: bytes) -> dict:
-    """Full CPU inference pipeline."""
-    import torch, numpy as np, cv2
+@spaces.GPU
+def analyze(pil_image):
+    """ZeroGPU inference — GPU allocated for the duration of this call."""
+    import json, torch, numpy as np, cv2
     from PIL import Image
     import torchvision.transforms.functional as TF
     from torchvision.ops import nms
     from torchvision import transforms as T
 
-    _ensure_loaded()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _load_models(device)
 
     if stage1_model is None:
-        return {"status": "error", "message": "Stage 1 model failed to load."}
+        return json.dumps({"status": "error", "message": "Stage 1 model failed to load."})
 
-    device = torch.device("cpu")
+    buf = io.BytesIO()
+    pil_image.save(buf, format="JPEG")
+    image_bytes = buf.getvalue()
 
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     W, H = pil.size
@@ -126,130 +133,92 @@ def _run_inference(image_bytes: bytes) -> dict:
             fdi_list[oi] = min(fdi_start[q] + rank, fdi_start[q] + 7)
 
     annotated = np.array(pil)[..., ::-1].copy()
-    cv2.line(annotated, (int(mid_x), 0), (int(mid_x), H), (255, 255, 255), 2)
-    cv2.line(annotated, (0, int(mid_y)), (W, int(mid_y)), (255, 255, 255), 2)
-    for lbl, lx, ly in [("Q1", int(mid_x)+10, 20), ("Q2", 10, 20),
-                         ("Q3", 10, int(mid_y)+20), ("Q4", int(mid_x)+10, int(mid_y)+20)]:
-        cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+    cv2.line(annotated, (int(mid_x), 0), (int(mid_x), H), (255,255,255), 2)
+    cv2.line(annotated, (0, int(mid_y)), (W, int(mid_y)), (255,255,255), 2)
+    for lbl, lx, ly in [("Q1",int(mid_x)+10,20),("Q2",10,20),
+                         ("Q3",10,int(mid_y)+20),("Q4",int(mid_x)+10,int(mid_y)+20)]:
+        cv2.putText(annotated, lbl, (lx,ly), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
     tf = T.Compose([
-        T.Resize((224, 224)),
-        T.ToTensor(),
-        T.Normalize([.485, .456, .406], [.229, .224, .225])
+        T.Resize((224,224)), T.ToTensor(),
+        T.Normalize([.485,.456,.406],[.229,.224,.225])
     ])
     teeth, disease_counts = [], {}
 
     for box, mask, score, fdi in zip(boxes, masks, scores, fdi_list):
-        x1 = max(0, int(box[0])-10); y1 = max(0, int(box[1])-10)
-        x2 = min(W, int(box[2])+10); y2 = min(H, int(box[3])+10)
-        crop = pil.crop((x1, y1, x2, y2))
+        x1=max(0,int(box[0])-10); y1=max(0,int(box[1])-10)
+        x2=min(W,int(box[2])+10); y2=min(H,int(box[3])+10)
+        crop = pil.crop((x1,y1,x2,y2))
 
-        if stage2_model is not None and crop.width > 4 and crop.height > 4:
+        if stage2_model is not None and crop.width>4 and crop.height>4:
             with torch.no_grad():
-                tensor = tf(crop).unsqueeze(0).to(device)
-                p = torch.softmax(stage2_model(tensor), 1)[0].cpu().numpy()
+                p = torch.softmax(stage2_model(tf(crop).unsqueeze(0).to(device)),1)[0].cpu().numpy()
             li = int(p.argmax())
-            cls_r = {
-                "disease":    DISEASE_CLASSES[li],
-                "confidence": round(float(p[li]), 4),
-                "probabilities": {DISEASE_CLASSES[i]: round(float(v), 4) for i, v in enumerate(p)}
-            }
+            cls_r = {"disease": DISEASE_CLASSES[li], "confidence": round(float(p[li]),4),
+                     "probabilities": {DISEASE_CLASSES[i]: round(float(v),4) for i,v in enumerate(p)}}
         else:
             cls_r = {"disease": "Unknown", "confidence": 0.0, "probabilities": {}}
 
         d   = cls_r["disease"]
-        col = DISEASE_COLORS_BGR.get(d, (128, 128, 128))
+        col = DISEASE_COLORS_BGR.get(d, (128,128,128))
         mb  = (mask[0] > 0.5).astype(np.uint8)
         cl  = np.zeros_like(annotated)
-        cl[mb == 1] = col
+        cl[mb==1] = col
         annotated = cv2.addWeighted(annotated, 1.0, cl, 0.45, 0)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 2)
-        cv2.putText(annotated, str(fdi) if fdi else "?", (x1+2, y1+16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        cv2.rectangle(annotated,(x1,y1),(x2,y2),col,2)
+        cv2.putText(annotated,str(fdi) if fdi else "?",(x1+2,y1+16),cv2.FONT_HERSHEY_SIMPLEX,0.55,col,2)
         if d != "Healthy":
-            cv2.circle(annotated, (x2-6, y1+6), 6, (0, 0, 255), -1)
+            cv2.circle(annotated,(x2-6,y1+6),6,(0,0,255),-1)
 
-        disease_counts[d] = disease_counts.get(d, 0) + 1
+        disease_counts[d] = disease_counts.get(d,0)+1
         teeth.append({
-            "fdi_number":           fdi,
-            "detection_confidence": round(float(score), 4),
-            "bounding_box":         {"x1": int(box[0]), "y1": int(box[1]), "x2": int(box[2]), "y2": int(box[3])},
-            "disease":              d,
-            "disease_confidence":   cls_r["confidence"],
+            "fdi_number": fdi,
+            "detection_confidence": round(float(score),4),
+            "bounding_box": {"x1":int(box[0]),"y1":int(box[1]),"x2":int(box[2]),"y2":int(box[3])},
+            "disease": d, "disease_confidence": cls_r["confidence"],
             "disease_probabilities": cls_r["probabilities"],
-            "severity":             DISEASE_SEVERITY.get(d, "unknown"),
-            "advice":               DISEASE_ADVICE.get(d, ""),
+            "severity": DISEASE_SEVERITY.get(d,"unknown"),
+            "advice": DISEASE_ADVICE.get(d,""),
         })
 
     total    = len(teeth)
-    diseased = sum(1 for t in teeth if t["disease"] != "Healthy")
-    status   = ("no_teeth_detected" if total == 0 else
-                "all_healthy"       if diseased == 0 else
-                "mostly_healthy"    if diseased <= total * .25 else
-                "moderate_issues"   if diseased <= total * .5 else
-                "significant_issues")
+    diseased = sum(1 for t in teeth if t["disease"]!="Healthy")
+    status   = ("no_teeth_detected" if total==0 else "all_healthy" if diseased==0 else
+                "mostly_healthy" if diseased<=total*.25 else
+                "moderate_issues" if diseased<=total*.5 else "significant_issues")
 
     from PIL import Image as PILImage
-    out_pil = PILImage.fromarray(annotated[..., ::-1])
-    buf = io.BytesIO()
-    out_pil.save(buf, format="JPEG", quality=88)
-    b64 = base64.b64encode(buf.getvalue()).decode()
+    out_pil = PILImage.fromarray(annotated[...,::-1])
+    buf2 = io.BytesIO()
+    out_pil.save(buf2, format="JPEG", quality=88)
+    b64 = base64.b64encode(buf2.getvalue()).decode()
 
-    return {
+    return json.dumps({
         "status": "success",
         "summary": {
-            "total_teeth_detected": total,
-            "healthy_teeth":        total - diseased,
-            "diseased_teeth":       diseased,
-            "overall_status":       status,
-            "disease_breakdown":    disease_counts,
+            "total_teeth_detected": total, "healthy_teeth": total-diseased,
+            "diseased_teeth": diseased, "overall_status": status,
+            "disease_breakdown": disease_counts,
         },
-        "teeth":                  teeth,
+        "teeth": teeth,
         "annotated_image_base64": b64,
-        "model_info": {
-            "stage1": "Mask R-CNN (ResNet-50 FPN, 33 classes)",
-            "stage2": "ResNet-34 (5-class disease classifier)",
-            "device": "cpu",
-        },
-    }
+        "model_info": {"stage1": "Mask R-CNN (ResNet-50 FPN)",
+                       "stage2": "ResNet-34 (5-class)",
+                       "device": str(device)},
+    }, indent=2)
 
 
-# ── Gradio UI ────────────────────────────────────────────────────────────────
-def gradio_analyze(pil_image):
-    import json
-    buf = io.BytesIO()
-    pil_image.save(buf, format="JPEG")
-    result = _run_inference(buf.getvalue())
-    return json.dumps(result, indent=2)
-
-
+# ── Gradio UI + launch ────────────────────────────────────────────────────────
 demo = gr.Interface(
-    fn=gradio_analyze,
+    fn=analyze,
     inputs=gr.Image(type="pil", label="Upload Dental X-ray (JPEG/PNG)"),
     outputs=gr.Textbox(label="Analysis Result (JSON)", lines=30),
-    title="🦷 Dental X-ray Analysis API",
+    title="🦷 Dental X-ray Analysis",
     description=(
-        "**Stage 1** — Mask R-CNN (ResNet-50 FPN): detects & segments teeth, assigns FDI numbers.\n"
-        "**Stage 2** — ResNet-34: classifies each tooth as Healthy / Caries / Deep Caries / Impacted / Periapical Lesion.\n\n"
-        "REST endpoint also available: `POST /analyze` with `multipart/form-data` field `file`."
+        "**Stage 1** — Mask R-CNN: detects & segments teeth, assigns FDI numbers.\n"
+        "**Stage 2** — ResNet-34: classifies Healthy / Caries / Deep Caries / Impacted / Periapical Lesion."
     ),
     allow_flagging="never",
 )
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI()
-
-@app.post("/analyze")
-async def analyze_api(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    result = _run_inference(image_bytes)
-    return JSONResponse(result)
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "loaded": _loaded}
-
-app = gr.mount_gradio_app(app, demo, path="/")
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+demo.launch()
