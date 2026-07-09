@@ -17,6 +17,7 @@ if not hasattr(_hfhub, 'HfFolder'):
 import os, io, base64
 import gradio as gr
 import spaces
+import uvicorn
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
@@ -254,9 +255,9 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
-# ── FastAPI app — mount Gradio onto it ───────────────────────────────────────
-# gr.mount_gradio_app is the correct pattern for gradio 4.x in HF Spaces.
-# demo.app is only available AFTER demo.launch() which we must NOT call here.
+# ── FastAPI + explicit uvicorn.run() ─────────────────────────────────────────
+# HF Spaces does NOT auto-discover the ASGI app — uvicorn.run() is required.
+# Custom routes (/analyze, /health) are defined before mounting Gradio at "/".
 app = FastAPI()
 
 @app.post("/analyze")
@@ -270,3 +271,6 @@ async def health():
     return {"status": "ok", "loaded": _loaded}
 
 app = gr.mount_gradio_app(app, demo, path="/")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=7860)
