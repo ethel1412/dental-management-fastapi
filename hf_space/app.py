@@ -1,6 +1,6 @@
 """Dental ML API — pure FastAPI for HuggingFace Spaces.
-HF Spaces imports this module and serves `app` via its own ASGI runner.
-Do NOT call uvicorn.run() at module level.
+HF Spaces serves the module-level `app` FastAPI instance directly.
+Do NOT import gradio or call uvicorn.run() here.
 """
 import os, io, base64
 from fastapi import FastAPI, UploadFile, File
@@ -191,8 +191,8 @@ def _run_inference(image_bytes: bytes) -> dict:
         return {"status": "error", "message": str(e), "trace": traceback.format_exc()}
 
 
-# HF Spaces imports this module and serves `app` via its own ASGI runner.
-# Do NOT call uvicorn.run() at module level — HF starts the server itself.
+# HF Spaces serves this `app` object directly via its ASGI runner.
+# No uvicorn.run(), no gradio — HF handles the server lifecycle.
 app = FastAPI(title="Dental ML API")
 
 
