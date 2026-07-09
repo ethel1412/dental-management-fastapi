@@ -1,4 +1,8 @@
+gradio==4.44.1
+huggingface_hub==0.23.4
 spaces
+torch==2.9.1
+torchvision==0.20.1
 opencv-python-headless
 Pillow
 numpy
