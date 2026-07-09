@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir \
     huggingface_hub>=0.23.0 \
+    gradio==4.44.0 \
     opencv-python-headless \
     Pillow \
     numpy \
@@ -28,4 +29,5 @@ COPY app.py .
 
 EXPOSE 7860
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+# Run with python app.py so uvicorn.run() inside __main__ fires correctly
+CMD ["python", "app.py"]

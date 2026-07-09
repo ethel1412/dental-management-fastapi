@@ -1,23 +1,8 @@
-"""Dental ML API — Gradio + ZeroGPU for HuggingFace Spaces.
-Uses @spaces.GPU so inference runs on A100 (free ZeroGPU).
-Also exposes POST /analyze as a REST endpoint for the Render backend proxy.
+"""Dental ML API — Gradio + FastAPI for HuggingFace Spaces (CPU).
+Exposes POST /analyze as a REST endpoint and a Gradio UI at /.
 """
-# ── Patch huggingface_hub BEFORE gradio import ───────────────────────────────
-import huggingface_hub as _hfhub
-if not hasattr(_hfhub, 'HfFolder'):
-    class _FakeHfFolder:
-        @staticmethod
-        def get_token(): return None
-        @staticmethod
-        def save_token(token): pass
-        @staticmethod
-        def delete_token(): pass
-    _hfhub.HfFolder = _FakeHfFolder
-
-import os, io, base64
+import os, io, base64, uvicorn
 import gradio as gr
-import spaces
-import uvicorn
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download
@@ -96,9 +81,8 @@ def _ensure_loaded():
     _loaded = True
 
 
-@spaces.GPU
 def _run_inference(image_bytes: bytes) -> dict:
-    """Full pipeline. @spaces.GPU allocates A100 for the duration of this call."""
+    """Full CPU inference pipeline."""
     import torch, numpy as np, cv2
     from PIL import Image
     import torchvision.transforms.functional as TF
@@ -110,10 +94,7 @@ def _run_inference(image_bytes: bytes) -> dict:
     if stage1_model is None:
         return {"status": "error", "message": "Stage 1 model failed to load."}
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stage1_model.to(device)
-    if stage2_model is not None:
-        stage2_model.to(device)
+    device = torch.device("cpu")
 
     pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     W, H = pil.size
@@ -228,17 +209,17 @@ def _run_inference(image_bytes: bytes) -> dict:
         "model_info": {
             "stage1": "Mask R-CNN (ResNet-50 FPN, 33 classes)",
             "stage2": "ResNet-34 (5-class disease classifier)",
-            "device": str(device),
+            "device": "cpu",
         },
     }
 
 
 # ── Gradio UI ────────────────────────────────────────────────────────────────
 def gradio_analyze(pil_image):
+    import json
     buf = io.BytesIO()
     pil_image.save(buf, format="JPEG")
     result = _run_inference(buf.getvalue())
-    import json
     return json.dumps(result, indent=2)
 
 
@@ -246,7 +227,7 @@ demo = gr.Interface(
     fn=gradio_analyze,
     inputs=gr.Image(type="pil", label="Upload Dental X-ray (JPEG/PNG)"),
     outputs=gr.Textbox(label="Analysis Result (JSON)", lines=30),
-    title="\U0001f9b7 Dental X-ray Analysis API",
+    title="🦷 Dental X-ray Analysis API",
     description=(
         "**Stage 1** — Mask R-CNN (ResNet-50 FPN): detects & segments teeth, assigns FDI numbers.\n"
         "**Stage 2** — ResNet-34: classifies each tooth as Healthy / Caries / Deep Caries / Impacted / Periapical Lesion.\n\n"
@@ -255,9 +236,7 @@ demo = gr.Interface(
     allow_flagging="never",
 )
 
-# ── FastAPI + explicit uvicorn.run() ─────────────────────────────────────────
-# HF Spaces does NOT auto-discover the ASGI app — uvicorn.run() is required.
-# Custom routes (/analyze, /health) are defined before mounting Gradio at "/".
+# ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI()
 
 @app.post("/analyze")
