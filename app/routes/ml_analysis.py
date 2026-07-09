@@ -40,7 +40,7 @@ def _predict_sync(tmp_path: str) -> dict:
     client = _get_client()
     result = client.predict(
         handle_file(tmp_path),
-        api_name="/predict",
+        api_name="/analyze",
     )
     # The Space's gradio_analyze() returns a JSON string (see hf_space/app.py)
     return json.loads(result)
